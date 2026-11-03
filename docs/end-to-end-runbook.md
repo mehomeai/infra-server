@@ -219,7 +219,10 @@ approvals never widen capabilities; rejecting fails the run honestly
 ## 6. Cross-repo verification table (local finals; run each suite from its own repo)
 
 Overall report: `backend-server/docs/final-validation.md`. Implemented
-locally — not shipped; all changes uncommitted; remote GitHub CI did not run.
+on review branch `feat/home-agent-foundation` (committed/pushed; draft PR
+#1 pending review/checks); no merge to protected `main`, no deployed
+release. Results below are the local validation record; current remote PR
+check status not verified — see draft PR #1 checks.
 
 Local evidence root (ephemeral, not committed): `/private/tmp/me-opencode-live-20261103` — proof logs under `logs/`, release marker `source-release-ready.json`.
 
