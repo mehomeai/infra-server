@@ -1,0 +1,172 @@
+name: System acceptance (manual, pinned siblings)
+
+on:
+  workflow_dispatch:
+    inputs:
+      backend_ref:
+        description: 'Full 40-char commit SHA for mehomeai/backend-server'
+        required: true
+        type: string
+      phone_ref:
+        description: 'Full 40-char commit SHA for mehomeai/phone-app'
+        required: true
+        type: string
+      setup_ref:
+        description: 'Full 40-char commit SHA for mehomeai/setup-infra'
+        required: true
+        type: string
+      runtime_ref:
+        description: 'Full 40-char commit SHA for mehomeai/agentic-framework'
+        required: true
+        type: string
+
+# Read-only: this workflow never publishes credentials, never pushes, never
+# deploys. Upstream candidate handling stays in upstream-openmuse.yml where
+# untrusted code runs read-only and only the separate write-token job opens
+# a review PR.
+permissions:
+  contents: read
+
+concurrency:
+  group: system-acceptance
+  cancel-in-progress: false
+
+jobs:
+  system-acceptance:
+    name: Cross-repo acceptance on pinned SHAs
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      # Pins below reuse the SHAs already pinned in this repo's workflows
+      # (ci.yml / home-api.yml / upstream-openmuse.yml); no new versions.
+      - name: Validate required full SHAs
+        shell: bash
+        env:
+          BACKEND_REF: ${{ inputs.backend_ref }}
+          PHONE_REF: ${{ inputs.phone_ref }}
+          SETUP_REF: ${{ inputs.setup_ref }}
+          RUNTIME_REF: ${{ inputs.runtime_ref }}
+          HOME_SHA: ${{ github.sha }}
+        run: |
+          re='^[0-9a-f]{40}$'
+          for v in "$BACKEND_REF" "$PHONE_REF" "$SETUP_REF" "$RUNTIME_REF"; do
+            if ! [[ "$v" =~ $re ]]; then
+              echo "each sibling ref must be a full 40-char lowercase hex SHA"
+              exit 1
+            fi
+          done
+          echo "home uses current ref $HOME_SHA"
+
+      - name: Check out home (this repo) at current ref
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          path: siblings/infra-server
+
+      - name: Check out backend-server at pinned SHA
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: mehomeai/backend-server
+          ref: ${{ inputs.backend_ref }}
+          persist-credentials: false
+          path: siblings/backend-server
+
+      - name: Check out phone-app at pinned SHA
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: mehomeai/phone-app
+          ref: ${{ inputs.phone_ref }}
+          persist-credentials: false
+          path: siblings/phone-app
+
+      - name: Check out setup-infra at pinned SHA
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: mehomeai/setup-infra
+          ref: ${{ inputs.setup_ref }}
+          persist-credentials: false
+          path: siblings/setup-infra
+
+      - name: Check out agentic-framework at pinned SHA
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: mehomeai/agentic-framework
+          ref: ${{ inputs.runtime_ref }}
+          persist-credentials: false
+          path: siblings/agentic-framework
+
+      - name: Set up the tested Node runtime
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: 24.18.0
+
+      - name: Verify sibling layout present (fail, never skip-green)
+        shell: bash
+        run: |
+          test -f siblings/infra-server/src/server.mjs || { echo "missing implementation: siblings/infra-server/src/server.mjs"; exit 1; }
+          test -f siblings/backend-server/src/server.mjs || { echo "missing implementation: siblings/backend-server/src/server.mjs"; exit 1; }
+          test -f siblings/phone-app/src/index.ts || { echo "missing implementation: siblings/phone-app/src/index.ts"; exit 1; }
+          test -f siblings/phone-app/test/real-services.test.mjs || { echo "missing implementation: siblings/phone-app/test/real-services.test.mjs"; exit 1; }
+          test -f siblings/setup-infra/scripts/me_setup.py || { echo "missing implementation: siblings/setup-infra/scripts/me_setup.py"; exit 1; }
+          test -f siblings/setup-infra/scripts/me_lifecycle.py || { echo "missing implementation: siblings/setup-infra/scripts/me_lifecycle.py"; exit 1; }
+          test -f siblings/agentic-framework/src/me_runtime/bridge.py || { echo "missing implementation: siblings/agentic-framework/src/me_runtime/bridge.py"; exit 1; }
+          test -f siblings/agentic-framework/tests/run_home_delegation.mjs || { echo "missing implementation: siblings/agentic-framework/tests/run_home_delegation.mjs"; exit 1; }
+          test -f siblings/agentic-framework/tests/run_home_context.mjs || { echo "missing implementation: siblings/agentic-framework/tests/run_home_context.mjs"; exit 1; }
+          test -f siblings/infra-server/test/fixture-bridge.mjs || { echo "missing implementation: siblings/infra-server/test/fixture-bridge.mjs"; exit 1; }
+          python3 --version
+
+      - name: Install backend dependencies
+        run: npm ci --no-audit --no-fund
+        working-directory: siblings/backend-server
+
+      - name: Install exact runtime requirements and editable package
+        run: |
+          python3 -m venv .venv
+          .venv/bin/pip install -r requirements.txt
+          .venv/bin/pip install --no-deps -e .
+        working-directory: siblings/agentic-framework
+
+      - name: Home full suite with required runtime bridge (fail, never skip)
+        run: npm run test:home
+        working-directory: siblings/infra-server
+        env:
+          ME_HOME_REQUIRE_R2: "1"
+
+      - name: Home spike and upstream provenance
+        run: |
+          npm run test:spike
+          python3 scripts/upstream.py verify
+          python3 -m unittest discover -s scripts -p 'test_*.py' -v
+        working-directory: siblings/infra-server
+
+      - name: Backend full suite
+        run: npm test
+        working-directory: siblings/backend-server
+
+      - name: Phone portable suite
+        run: npm test
+        working-directory: siblings/phone-app
+
+      - name: Phone real-services suite against pinned siblings (fail, never skip)
+        run: npm run test:real
+        working-directory: siblings/phone-app
+        env:
+          ME_REAL_HOME_SRC: ${{ github.workspace }}/siblings/infra-server/src/server.mjs
+          ME_REAL_BACKEND_SRC: ${{ github.workspace }}/siblings/backend-server/src/server.mjs
+
+      - name: Runtime offline regression (fixture only, no live keys)
+        run: .venv/bin/python -m pytest tests --ignore=tests/test_live_optin.py -v
+        working-directory: siblings/agentic-framework
+        env:
+          ME_RUNTIME_LIVE_TESTS: ""
+
+      - name: Runtime home runners against actual home (fail, never skip)
+        run: node --experimental-transform-types --disable-warning=ExperimentalWarning --test --test-concurrency=1 tests/run_home_*.mjs
+        working-directory: siblings/agentic-framework
+        env:
+          ME_RUNTIME_REQUIRE_HOME: "1"
+
+      - name: Setup all suites (setup, lifecycle, full-backup, crash-window)
+        run: python3 -m unittest discover -s scripts -p 'test_me*.py' -v
+        working-directory: siblings/setup-infra

@@ -27,3 +27,25 @@ jobs:
         run: python3 scripts/check_repository.py
       - name: Check whitespace
         run: git show --format= --check HEAD
+
+  reuse-integration:
+    name: Reused worker and upstream tooling
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Set up the tested Node runtime
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: 24.18.0
+      - name: Verify imported source and attribution manifest
+        run: python3 scripts/upstream.py verify
+      - name: Test fixed-path updater and candidate publishing boundary
+        run: python3 -m unittest discover -s scripts -p 'test_*.py' -v
+      - name: Test the actual upstream task worker with home persistence
+        run: npm run test:spike
+      - name: Run the model-free home demonstration
+        run: npm run demo:spike
