@@ -1,0 +1,6 @@
+# Me home tenant package (pinned OpenBot native schema, personal only).
+# Loaded read-only by the upstream server at boot (TENANT_PACKAGE_DIR).
+# See server/src/tenant-package.ts in the pinned checkout for the contract.
+tenant:
+  id: me-home
+  product_name: Me

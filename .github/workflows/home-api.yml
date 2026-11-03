@@ -43,3 +43,7 @@ jobs:
         run: python3 -m unittest discover -s scripts -p 'test_*.py' -v
       - name: Verify imported source and attribution manifest
         run: python3 scripts/upstream.py verify
+      - name: Run upstream suites (proxy/identity/doctor/patch ledger)
+        run: npm run test:upstream
+      - name: Verify OpenBot pin lock (offline, no network)
+        run: python3 scripts/upstream-openbot.py verify

@@ -23,6 +23,15 @@ import {
   resolveNotificationConfig,
 } from './notifications.mjs';
 import { createCoordinator } from './coordinator.mjs';
+import {
+  capabilityReport,
+  classifyProxyPath,
+  forwardNative,
+  proxyToUpstream,
+} from './upstream-proxy.mjs';
+import { doctorCachePath } from './upstream-doctor.mjs';
+import { createLiveTracker } from './upstream-live.mjs';
+import { submitToUpstream } from './upstream-full.mjs';
 
 export const CONTRACT_VERSION = 'home-api-v1';
 export const DEFAULT_PORT = 7070;
@@ -61,11 +70,27 @@ async function readBody(req) {
     chunks.push(chunk);
   }
   if (chunks.length === 0) return null;
+  return parseJsonBody(Buffer.concat(chunks));
+}
+
+function parseJsonBody(raw) {
   try {
-    return JSON.parse(Buffer.concat(chunks).toString('utf8'));
+    return JSON.parse(raw.toString('utf8'));
   } catch {
     throw Object.assign(new Error('Invalid JSON body'), { status: 400 });
   }
+}
+
+async function readRawBody(req) {
+  const chunks = [];
+  let size = 0;
+  for await (const chunk of req) {
+    size += chunk.length;
+    if (size > MAX_BODY_BYTES) throw Object.assign(new Error('Body too large'), { status: 413 });
+    chunks.push(chunk);
+  }
+  if (chunks.length === 0) return null;
+  return Buffer.concat(chunks);
 }
 
 function bearerToken(req) {
@@ -245,7 +270,7 @@ function storeMessage(db, conv, session, body) {
   return { ok: true, status: 201, record: { ...row, duplicate: false } };
 }
 
-export function createHomeServer({ dbPath, broker: brokerOverrides = {}, rateLimit: rateLimitOverrides, env = process.env, notifications: notificationOverrides = {}, coordinator: coordinatorOverrides = {} } = {}) {
+export function createHomeServer({ dbPath, broker: brokerOverrides = {}, rateLimit: rateLimitOverrides, env = process.env, notifications: notificationOverrides = {}, coordinator: coordinatorOverrides = {}, upstreamFetch = fetch, liveIntervalMs = 120_000, liveTtlMs = null, liveKick = true } = {}) {
   const { db, installationId } = openHomeDb(dbPath);
   // H8 coordinator (disabled by default): consumes the S7-written private
   // credentials file and heartbeats the hosted backend. No outbound network
@@ -310,6 +335,17 @@ export function createHomeServer({ dbPath, broker: brokerOverrides = {}, rateLim
   // credential routes. Trusts only the direct peer unless HOME_TRUST_PROXY=1
   // with a loopback peer (see rate-limit.mjs).
   const authLimiter = createRateLimiter(rateLimitOverrides ?? resolveRateLimit(env));
+  // In-home live evidence (FULL): bounded background singleflight refresh;
+  // the capability path reads the in-memory snapshot and never awaits the
+  // network. Cache path is shared with the CLI/doctor runs:
+  // $ME_DATA_DIR/doctor-cache.json when HOME_DB lives there.
+  const liveTracker = createLiveTracker({
+    env,
+    fetchImpl: upstreamFetch,
+    intervalMs: liveIntervalMs,
+    ...(liveTtlMs == null ? {} : { ttlMs: liveTtlMs }),
+    cachePath: env.ME_DOCTOR_CACHE ?? doctorCachePath(dbPath),
+  });
   let http = null;
 
   // Returns true when the request must stop here (429 already sent).
@@ -340,8 +376,18 @@ export function createHomeServer({ dbPath, broker: brokerOverrides = {}, rateLim
     const method = req.method;
 
     // Minimal anonymous health surface only. No user/device/data details here.
+    // Additive FULL capability fields (absence = legacy home). fullConfigured
+    // requires fresh bounded live doctor evidence, never env presence alone.
+    // Synchronous in-memory read: fast health/pairing never await the network.
+    const liveEvidence = () => {
+      try {
+        return liveTracker.get();
+      } catch {
+        return { live: false, reason: 'missing' };
+      }
+    };
     if (method === 'GET' && pathname === '/healthz') {
-      send(res, 200, { status: 'ok', installation_id: installationId, contract: CONTRACT_VERSION });
+      send(res, 200, { status: 'ok', installation_id: installationId, contract: CONTRACT_VERSION, ...capabilityReport(env, liveEvidence()) });
       return;
     }
     if (method === 'GET' && pathname === '/readyz') {
@@ -417,11 +463,65 @@ export function createHomeServer({ dbPath, broker: brokerOverrides = {}, rateLim
       return;
     }
 
+    // FULL primary: native upstream REST behind the same paired authority.
+    // Home validated ht1_* above, maps 1:1 server-side and signs a
+    // short-lived single-use assertion; upstream consumes it via the
+    // home-bridge patch (vendor/openbot/patches/0001). Phone credentials,
+    // cookies, forged x-me-* and private keys are stripped and never
+    // forwarded; the private listener is never directly reachable.
+    // Known-but-untunneled paths (channel live events) answer 501, unknown
+    // paths 404/405 — never silently legacy.
+    if ((env.ME_UPSTREAM_MODE ?? 'core').trim().toLowerCase() === 'full') {
+      const verdict = classifyProxyPath(pathname, method);
+      if (verdict.route === 'pending') {
+        fail(res, 501, 'ws_tunnel_pending', 'Channel live events have no home tunnel yet (polling + push primary)');
+        return;
+      }
+      if (verdict.route === 'deny' && verdict.status === 405) {
+        fail(res, 405, 'method_not_allowed', 'Method not allowed on this native path');
+        return;
+      }
+      if (verdict.route === 'proxy') {
+        let bodyBytes = null;
+        if (method !== 'GET' && method !== 'HEAD') {
+          try {
+            bodyBytes = await readRawBody(req);
+          } catch (error) {
+            fail(res, error.status ?? 400, 'bad_request', error.message);
+            return;
+          }
+        }
+        // Client disconnect aborts the upstream call: bounded lifetime both ways.
+        const disconnect = new AbortController();
+        req.on('close', () => disconnect.abort());
+        const headers = {};
+        for (const [k, v] of Object.entries(req.headers ?? {})) headers[k] = Array.isArray(v) ? v.join(', ') : v;
+        try {
+          const out = await proxyToUpstream({
+            db, req, pathname, search: url.search ?? '', method, headers, bodyBytes, env, fetchImpl: upstreamFetch,
+          });
+          if (disconnect.signal.aborted) return;
+          const contentType = out.headers['content-type'] ?? 'application/json';
+          res.writeHead(out.status, {
+            'content-type': contentType,
+            'content-length': out.body.length,
+            'x-content-type-options': 'nosniff',
+          });
+          res.end(out.body);
+        } catch (error) {
+          if (disconnect.signal.aborted) return;
+          fail(res, error.status ?? 502, error.code ?? 'upstream_unavailable', String(error.message ?? 'Upstream unavailable').slice(0, 500));
+        }
+        return;
+      }
+    }
+
     if (method === 'GET' && pathname === '/v1/me') {
       send(res, 200, {
         user_id: session.user_id,
         device_id: session.device_id,
         installation_id: installationId,
+        ...capabilityReport(env, liveEvidence()),
       });
       return;
     }
@@ -548,7 +648,32 @@ export function createHomeServer({ dbPath, broker: brokerOverrides = {}, rateLim
         fail(res, 404, 'not_found', 'Conversation not found');
         return;
       }
+      const fullMode = (env.ME_UPSTREAM_MODE ?? 'core').trim().toLowerCase() === 'full';
       if (method === 'GET') {
+        // FULL primary reads the authoritative upstream roster; legacy home
+        // rows stay available via their explicit task ids below.
+        if (fullMode) {
+          try {
+            const out = await forwardNative({ db, session, pathname: '/api/channels/', search: url.search ?? '', method: 'GET', env, fetchImpl: upstreamFetch });
+            let body = null;
+            try { body = out.json(); } catch { body = null; }
+            if (!out.ok) {
+              fail(res, out.status, 'upstream_refused', 'Upstream channel roster refused');
+              return;
+            }
+            const channels = body?.channels ?? [];
+            send(res, 200, {
+              tasks: channels.map((c) => ({
+                id: c.id, title: c.name ?? 'Untitled', active: c.active ?? null,
+                execution: 'full-upstream', upstream: { channel: c },
+              })),
+              execution: 'full-upstream',
+            });
+          } catch (error) {
+            fail(res, error.status ?? 502, error.code ?? 'upstream_unavailable', String(error.message ?? 'Upstream unavailable').slice(0, 500));
+          }
+          return;
+        }
         const tasks = await broker.listViews(session.user_id, conv.id);
         send(res, 200, { tasks });
         return;
@@ -559,6 +684,28 @@ export function createHomeServer({ dbPath, broker: brokerOverrides = {}, rateLim
           body = await readBody(req);
         } catch (error) {
           fail(res, error.status ?? 400, 'bad_request', error.message);
+          return;
+        }
+        // FULL primary executes on the real upstream router/worker via the
+        // native channel+message calls (no local runner, no second
+        // scheduler). agentId is explicit: read proxied GET /api/agents.
+        if (fullMode) {
+          for (const key of ['model', 'workspace', 'run_id', 'user_id', 'conversation_id', 'conversationId']) {
+            if (body && typeof body === 'object' && key in body) {
+              fail(res, 400, 'bad_request', `Field is home-managed: ${key}`);
+              return;
+            }
+          }
+          try {
+            const out = await submitToUpstream(db, {
+              session, homeConversationId: conv.id, title: body?.title,
+              request: body?.request, agentId: body?.agentId, env, fetchImpl: upstreamFetch,
+            });
+            send(res, 201, out.task);
+          } catch (error) {
+            const status = error.status ?? statusFor(error.code);
+            fail(res, status, error.code ?? 'bad_request', String(error.message ?? 'submit failed').slice(0, 500));
+          }
           return;
         }
         // The home selects model/workspace/identity. Client overrides are
@@ -593,6 +740,37 @@ export function createHomeServer({ dbPath, broker: brokerOverrides = {}, rateLim
 
     const taskMatch = pathname.match(/^\/v1\/tasks\/([^/]+)$/);
     if (method === 'GET' && taskMatch) {
+      const fullMode = (env.ME_UPSTREAM_MODE ?? 'core').trim().toLowerCase() === 'full';
+      // FULL primary: the task IS the upstream channel (authoritative read).
+      // Legacy home rows (broker ids) keep serving explicitly below.
+      if (fullMode) {
+        try {
+          const out = await forwardNative({ db, session, pathname: `/api/channels/${encodeURIComponent(taskMatch[1])}`, method: 'GET', env, fetchImpl: upstreamFetch });
+          if (out.status === 404) {
+            const view = await broker.taskView(session.user_id, taskMatch[1], { withProgress: true });
+            if (!view) {
+              fail(res, 404, 'not_found', 'Task not found');
+              return;
+            }
+            send(res, 200, view);
+            return;
+          }
+          let body = null;
+          try { body = out.json(); } catch { body = null; }
+          if (!out.ok) {
+            fail(res, out.status, 'upstream_refused', 'Upstream task refused');
+            return;
+          }
+          const channel = body?.channel ?? body;
+          send(res, 200, {
+            id: channel?.id ?? taskMatch[1], title: channel?.name ?? 'Untitled',
+            active: channel?.active ?? null, execution: 'full-upstream', upstream: { channel },
+          });
+        } catch (error) {
+          fail(res, error.status ?? 502, error.code ?? 'upstream_unavailable', String(error.message ?? 'Upstream unavailable').slice(0, 500));
+        }
+        return;
+      }
       const view = await broker.taskView(session.user_id, taskMatch[1], { withProgress: true });
       if (!view) {
         fail(res, 404, 'not_found', 'Task not found');
@@ -759,6 +937,12 @@ export function createHomeServer({ dbPath, broker: brokerOverrides = {}, rateLim
     notifications,
     coordinator,
     async start({ host = DEFAULT_HOST, port = DEFAULT_PORT } = {}) {
+      // Live evidence only applies to FULL; legacy never probes upstream.
+      // liveKick=false keeps the construction seed only (tests); production
+      // always kicks immediately so a restart re-verifies without waiting.
+      if ((env.ME_UPSTREAM_MODE ?? 'core').trim().toLowerCase() === 'full') {
+        try { liveTracker.start({ kick: liveKick }); } catch { /* liveness is auxiliary */ }
+      }
       await broker.start();
       // Coordinator initial heartbeat is async + nonblocking by design.
       try { await coordinator.start(); } catch { /* coordinator never fails start */ }
@@ -779,6 +963,7 @@ export function createHomeServer({ dbPath, broker: brokerOverrides = {}, rateLim
       // briefly for in-flight requests, then force-close the rest so a hung
       // peer can never wedge shutdown. Broker stop (bounded internally) runs
       // while the DB is still open; the DB closes last.
+      try { liveTracker.stop(); } catch { /* best effort */ }
       if (http) {
         const closing = http;
         http = null;
@@ -808,7 +993,9 @@ export function createHomeServer({ dbPath, broker: brokerOverrides = {}, rateLim
 }
 
 function statusFor(code) {
-  if (code === 'model_not_configured' || code === 'runtime_not_configured') return 503;
+  if (code === 'model_not_configured' || code === 'runtime_not_configured' || code === 'upstream_not_configured') return 503;
+  if (code === 'unauthorized') return 401;
+  if (code === 'not_found' || code === 'upstream_not_linked') return 404;
   if (code === 'delegation_conflict') return 409;
   if (code === 'delegation_denied' || code === 'capability_denied') return 400;
   return 400;

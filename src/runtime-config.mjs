@@ -101,7 +101,53 @@ export function resolveModelConfig(env = process.env) {
 }
 
 export function configError(message) {
-  return Object.assign(new Error(message), { code: 'model_not_configured' });
+  throw Object.assign(new Error(message), { code: 'model_not_configured' });
+}
+
+// Native harness model selection: the SINGLE source of truth shared by the
+// harness container (BOT_PROVIDER/BOT_MODEL + provider keys/base URL), the
+// tenant model.yaml, and the FULL doctor check. The legacy HOME_MODEL_*
+// selector stays for the old home runtime only and is NEVER used to verify
+// the native stack (a doctor must verify what production runs).
+//
+// BOT_MODEL may carry a provider:model prefix (per B runtime-wire-contract);
+// the prefix wins when present. Defaults match the compose + tenant files:
+// openai/gpt-5.5, anthropic/claude-haiku-4-5. google requires an explicit
+// BOT_MODEL (no invented default).
+export const NATIVE_MODEL_DEFAULTS = { openai: 'gpt-5.5', anthropic: 'claude-haiku-4-5' };
+export const NATIVE_MODEL_PROVIDERS = ['openai', 'anthropic', 'google'];
+
+export function resolveNativeModelConfig(env = process.env) {
+  let provider = String(env.BOT_PROVIDER ?? 'openai').trim().toLowerCase() || 'openai';
+  let model = String(env.BOT_MODEL ?? '').trim();
+  const prefixed = model.match(/^([A-Za-z]+):(.+)$/);
+  if (prefixed) {
+    provider = prefixed[1].trim().toLowerCase();
+    model = prefixed[2].trim();
+  }
+  if (!NATIVE_MODEL_PROVIDERS.includes(provider)) {
+    throw Object.assign(new Error(`BOT_PROVIDER must be one of ${NATIVE_MODEL_PROVIDERS.join('|')} (got ${JSON.stringify(provider)})`), { code: 'model_not_configured' });
+  }
+  if (!model) {
+    model = NATIVE_MODEL_DEFAULTS[provider] ?? null;
+    if (!model) {
+      throw configError(`BOT_MODEL is required for provider ${provider} (no default; set the exact model id)`);
+    }
+  }
+  const keyEnv = { openai: 'OPENAI_API_KEY', anthropic: 'ANTHROPIC_API_KEY', google: 'GOOGLE_API_KEY' }[provider];
+  const key = String(env[keyEnv] ?? '').trim() || null;
+  const baseUrl = String(env.OPENAI_BASE_URL ?? '').trim() || null;
+  if (provider === 'openai') {
+    return {
+      provider, model, keyEnv, key,
+      endpoint: (baseUrl ?? 'https://api.openai.com/v1').replace(/\/$/, ''),
+      localRoute: Boolean(baseUrl) && !key,
+    };
+  }
+  if (provider === 'anthropic') {
+    return { provider, model, keyEnv, key, endpoint: 'https://api.anthropic.com' };
+  }
+  return { provider, model, keyEnv, key, endpoint: 'https://generativelanguage.googleapis.com' };
 }
 
 export function isConfigError(error) {

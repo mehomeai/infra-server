@@ -1,0 +1,26 @@
+{
+  "schema": 1,
+  "repository": "CopilotKit/OpenBot",
+  "baseCommit": "6bfee780c8e8d05141375ea55ebde33eefb3dbc0",
+  "patch": "0001-home-identity-bridge.patch",
+  "patchSha256": "e6575f1013719ebca52816f2f03f8e77d1192aa5532b4db6957cb3a2c6cde871",
+  "files": {
+    "server/src/config.ts": {
+      "originalSha256": "d210a4d4b3c43b869aa38483e5815ac0c3b3f77a6df2d66b5325d7510e3cf3c3",
+      "postSha256": "03fcdbbf45b1423f8fb1a334c9dcb4c59016701ef3b02266990445c05313ab61"
+    },
+    "server/src/index.ts": {
+      "originalSha256": "6d0fa8dc72ae62d7b41f1a35083b1e8e82f53c2fda27255457416075b5d10ddd",
+      "postSha256": "83a049d5a4adf096e5ddc1f7b4f66388f0b09748f41d9d29a277b42092599701"
+    },
+    "server/src/home-bridge.ts": {
+      "originalSha256": null,
+      "postSha256": "f08df17d508698fbc13d4ce6ef527dfb4296b089da8ab91dcf2e0123d96b1faa"
+    }
+  },
+  "unmodified": {
+    "server/src/request-actor.ts": "95099b80ec151b1a6cb0989b52e4f6503012237b834c7def1170f5346830ab77",
+    "server/src/auth/guards.ts": "20071b33c99d937d551befb37532cc724e1ef29a7d1c23a53e707c7f4c3fed8f",
+    "server/src/auth/dev-actor.ts": "386761a86d0c5e3a3ad172f4bdb463b5d0653ca9cb525ebd5554eff81982c6b3"
+  }
+}

@@ -1,0 +1,212 @@
+name: Evaluate OpenBot upstream update
+
+on:
+  schedule:
+    - cron: '23 9 * * 1'
+  workflow_dispatch:
+    inputs:
+      revision:
+        description: 'Optional full upstream commit SHA; empty checks main'
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: upstream-openbot
+  cancel-in-progress: false
+
+jobs:
+  candidate:
+    name: Test OpenBot candidate without publishing credentials
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      changed: ${{ steps.check.outputs.changed }}
+      revision: ${{ steps.check.outputs.revision }}
+      previous_revision: ${{ steps.check.outputs.previous_revision }}
+      patch_compatible: ${{ steps.patchcheck.outputs.compatible }}
+      base_revision: ${{ steps.baseline.outputs.revision }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+      - name: Record the exact baseline tested
+        id: baseline
+        run: printf 'revision=%s\n' "$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: 24.18.0
+      - name: Verify updater before downloading code
+        run: python3 -m unittest discover -s scripts -p 'test_*.py' -v
+      - name: Check for a new pinned revision (read-only)
+        id: check
+        env:
+          REQUESTED_REVISION: ${{ inputs.revision }}
+        shell: bash
+        run: |
+          args=()
+          if [ -n "$REQUESTED_REVISION" ]; then
+            args+=(--revision "$REQUESTED_REVISION")
+          fi
+          python3 scripts/upstream-openbot.py check "${args[@]}"
+      - name: Fetch candidate bundle (sources only, never executed)
+        if: steps.check.outputs.changed == 'true'
+        env:
+          REVISION: ${{ steps.check.outputs.revision }}
+        run: python3 scripts/upstream-openbot.py fetch-bundle --revision "$REVISION" --bundle "$RUNNER_TEMP/openbot-candidate"
+      - name: Check the home patch still applies to the candidate seam
+        id: patchcheck
+        if: steps.check.outputs.changed == 'true'
+        shell: bash
+        run: |
+          rm -rf "$RUNNER_TEMP/patch-seam" && mkdir -p "$RUNNER_TEMP/patch-seam/server/src"
+          for f in index.ts config.ts; do
+            cp "$RUNNER_TEMP/openbot-candidate/server/src/$f" "$RUNNER_TEMP/patch-seam/server/src/$f"
+          done
+          git -C "$RUNNER_TEMP/patch-seam" init -q
+          git -C "$RUNNER_TEMP/patch-seam" add -A
+          git -C "$RUNNER_TEMP/patch-seam" -c user.email=ci@local -c user.name=ci commit -qm base
+          if git -C "$RUNNER_TEMP/patch-seam" apply --check "$GITHUB_WORKSPACE/vendor/openbot/patches/0001-home-identity-bridge.patch"; then
+            printf 'compatible=%s\n' "true" >> "$GITHUB_OUTPUT"
+          else
+            printf 'compatible=%s\n' "false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Run home + upstream suites against the current pin
+        if: steps.check.outputs.changed == 'true'
+        run: |
+          npm run test:home
+          npm run test:upstream
+      - name: Save only candidate source data
+        if: steps.check.outputs.changed == 'true'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: openbot-candidate
+          path: ${{ runner.temp }}/openbot-candidate
+          if-no-files-found: error
+          retention-days: 7
+
+  candidate-source-test:
+    name: Isolated candidate-source verification (read-only, no secrets)
+    needs: candidate
+    if: needs.candidate.outputs.changed == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.candidate.outputs.base_revision }}
+          persist-credentials: false
+      - uses: actions/download-artifact@634f93cb2916e3fdff678855b9b062d0335ce0 # v5
+        with:
+          name: openbot-candidate
+          path: ${{ runner.temp }}/openbot-candidate
+      # Never executes candidate code: recomputes digests from the bundle
+      # files, validates the revision.json schema, and checks the home patch
+      # against the candidate seam in an isolated temp tree. The revision.json
+      # artifact is trusted metadata (written by the read-only candidate job);
+      # the candidate sources themselves are data under test, never run.
+      - name: Re-verify candidate bundle integrity + patch seam in isolation
+        env:
+          REVISION: ${{ needs.candidate.outputs.revision }}
+        shell: bash
+        run: |
+          python3 - <<'EOF'
+          import hashlib, json, sys
+          from pathlib import Path
+          bundle = Path('${{ runner.temp }}/openbot-candidate')
+          report = json.loads((bundle / 'revision.json').read_text())
+          assert report['repository'] == 'CopilotKit/OpenBot', report
+          assert report['revision'] == '${{ needs.candidate.outputs.revision }}', report
+          assert isinstance(report.get('files'), dict) and report['files'], 'files manifest required'
+          assert 'index_sha256' in report, 'candidate seam hash required'
+          for name, want in report['files'].items():
+              assert '..' not in name and not name.startswith('/'), name
+              got = hashlib.sha256((bundle / name).read_bytes()).hexdigest()
+              assert got == want, f'candidate bundle tampered: {name}'
+          seam = bundle / 'server/src/index.ts'
+          got = hashlib.sha256(seam.read_bytes()).hexdigest()
+          assert got == report['index_sha256'], 'candidate seam hash mismatch'
+          print(f"candidate bundle verified: {report['revision']} ({len(report['files'])} files + seam)")
+          EOF
+          rm -rf "$RUNNER_TEMP/iso-seam" && mkdir -p "$RUNNER_TEMP/iso-seam/server/src"
+          for f in index.ts config.ts; do
+            cp "$RUNNER_TEMP/openbot-candidate/server/src/$f" "$RUNNER_TEMP/iso-seam/server/src/$f"
+          done
+          git -C "$RUNNER_TEMP/iso-seam" init -q
+          git -C "$RUNNER_TEMP/iso-seam" add -A
+          git -C "$RUNNER_TEMP/iso-seam" -c user.email=ci@local -c user.name=ci commit -qm base
+          git -C "$RUNNER_TEMP/iso-seam" apply --check "$GITHUB_WORKSPACE/vendor/openbot/patches/0001-home-identity-bridge.patch" \
+            && echo 'candidate seam: patch applies cleanly' \
+            || { echo 'candidate seam: patch needs a rebase (review gate, not a failure of the pin)'; exit 1; }
+
+  propose:
+    name: Open a review PR without executing candidate code
+    needs: [candidate, candidate-source-test]
+    if: needs.candidate.outputs.changed == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.candidate.outputs.base_revision }}
+          persist-credentials: false
+      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          name: openbot-candidate
+          path: ${{ runner.temp }}/openbot-candidate
+      - name: Propose a candidate review (pin update stays human)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REVISION: ${{ needs.candidate.outputs.revision }}
+          PREVIOUS_REVISION: ${{ needs.candidate.outputs.previous_revision }}
+          PATCH_COMPATIBLE: ${{ needs.candidate.outputs.patch_compatible }}
+          BASE_BRANCH: ${{ github.event.repository.default_branch }}
+        shell: bash
+        run: |
+          branch="upstream/openbot-$REVISION"
+          if gh pr view "$branch" --json number >/dev/null 2>&1; then
+            echo 'An update PR already exists for this revision.'
+            exit 0
+          fi
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git checkout -b "$branch"
+          mkdir -p .github
+          cp "$RUNNER_TEMP/openbot-candidate/revision.json" ".github/openbot-candidate-$REVISION.json"
+          git add -- ".github/openbot-candidate-$REVISION.json"
+          git diff --cached --quiet && exit 0
+          git commit -m "chore: evaluate OpenBot $REVISION (candidate report only)"
+          gh auth setup-git
+          git push origin "$branch"
+          {
+            echo "OpenBot candidate \`$REVISION\` (previous \`$PREVIOUS_REVISION\`)."
+            echo
+            echo "Home patch 0001 applies to the candidate seam: \`$PATCH_COMPATIBLE\`."
+            echo
+            echo "This PR carries ONLY the candidate digest report. It does NOT update"
+            echo "\`vendor/openbot/upstream.json\` and does NOT merge automatically."
+            echo
+            echo "To adopt after review:"
+            echo "1. Run \`python3 scripts/upstream-openbot.py verify --fetch\` at the candidate,"
+            echo "   rebase \`vendor/openbot/patches/0001-*\` if the seam moved, update the"
+            echo "   patch ledger + \`scripts/openbot-checkout.sh\` sparse list if paths changed."
+            echo "2. Run \`sh scripts/openbot-checkout.sh --full\` +"
+            echo "   \`python3 scripts/upstream-openbot.py verify --deployed OPENBOT_CHECKOUT\`."
+            echo "3. Run FULL suites + Linux Docker acceptance (system-acceptance.yml)."
+            echo "4. Commit the pin + patch changes on this branch for a second review."
+            echo
+            echo "Review the source/license diff, isolation implications, and API changes."
+            echo "Candidate code never executes in CI; GitHub-token PRs may not trigger"
+            echo "push/PR workflows: dispatch CI on this branch manually after review."
+            printf '\nFull upstream comparison: https://github.com/CopilotKit/OpenBot/compare/%s...%s\n' "$PREVIOUS_REVISION" "$REVISION"
+            printf '\nCandidate run: %s/%s/actions/runs/%s\n' "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID"
+          } > "$RUNNER_TEMP/upstream-pr.md"
+          gh pr create --base "$BASE_BRANCH" --head "$branch" --title "chore: evaluate OpenBot $REVISION" --body-file "$RUNNER_TEMP/upstream-pr.md"
