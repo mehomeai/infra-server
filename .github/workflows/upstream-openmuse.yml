@@ -1,0 +1,131 @@
+name: Evaluate OpenMuse upstream update
+
+on:
+  schedule:
+    - cron: '17 9 * * 1'
+  workflow_dispatch:
+    inputs:
+      revision:
+        description: 'Optional full upstream commit SHA; empty checks main'
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: upstream-openmuse
+  cancel-in-progress: false
+
+jobs:
+  candidate:
+    name: Test upstream without publishing credentials
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      changed: ${{ steps.update.outputs.changed }}
+      revision: ${{ steps.update.outputs.revision }}
+      previous_revision: ${{ steps.update.outputs.previous_revision }}
+      base_revision: ${{ steps.baseline.outputs.revision }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+      - name: Record the exact baseline tested
+        id: baseline
+        run: printf 'revision=%s\n' "$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: 24.18.0
+      - name: Verify updater before downloading code
+        run: python3 -m unittest discover -s scripts -p 'test_*.py' -v
+      - name: Prepare fixed-path upstream candidate
+        id: update
+        env:
+          REQUESTED_REVISION: ${{ inputs.revision }}
+        shell: bash
+        run: |
+          args=()
+          if [ -n "$REQUESTED_REVISION" ]; then
+            args+=(--revision "$REQUESTED_REVISION")
+          fi
+          python3 scripts/upstream.py update "${args[@]}" --bundle "$RUNNER_TEMP/upstream-candidate"
+      - name: Verify and test candidate
+        if: steps.update.outputs.changed == 'true'
+        run: |
+          python3 scripts/upstream.py verify
+          npm run test:spike
+          npm run demo:spike
+      - name: Save only candidate source data
+        if: steps.update.outputs.changed == 'true'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: openmuse-candidate
+          path: ${{ runner.temp }}/upstream-candidate
+          if-no-files-found: error
+          retention-days: 7
+
+  propose:
+    name: Open a review PR without executing candidate code
+    needs: candidate
+    if: needs.candidate.outputs.changed == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.candidate.outputs.base_revision }}
+          persist-credentials: false
+      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          name: openmuse-candidate
+          path: ${{ runner.temp }}/upstream-candidate
+      - name: Validate candidate data with the approved updater
+        env:
+          REVISION: ${{ needs.candidate.outputs.revision }}
+        run: python3 scripts/upstream.py promote --bundle "$RUNNER_TEMP/upstream-candidate" --revision "$REVISION"
+      - name: Propose a source-pin update
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REVISION: ${{ needs.candidate.outputs.revision }}
+          BASE_BRANCH: ${{ github.event.repository.default_branch }}
+          PREVIOUS_REVISION: ${{ needs.candidate.outputs.previous_revision }}
+        shell: bash
+        run: |
+          branch="upstream/openmuse-$REVISION"
+          if gh pr view "$branch" --json number >/dev/null 2>&1; then
+            echo 'An update PR already exists for this revision.'
+            exit 0
+          fi
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git checkout -b "$branch"
+          git add -- vendor/openmuse
+          git diff --cached --quiet && exit 0
+          git commit -m "chore: evaluate OpenMuse $REVISION"
+          gh auth setup-git
+          git push origin "$branch"
+          cat > "$RUNNER_TEMP/upstream-pr.md" <<'BODY'
+          Refresh the fixed, unpatched OpenMuse worker subset and its source hashes.
+
+          The candidate passed the model-free home integration suite and demonstration
+          before publishing. Candidate tests run separately from this write-token job.
+
+          This refresh imports only the listed worker files. New upstream UI,
+          tools, and features need explicit adoption and their own acceptance checks.
+
+          Review the source/license diff, household isolation implications, missing
+          imports, and API changes. These tests do not cover a live model, browser,
+          phone/backend transport, production authorization, or upstream's full build.
+
+          This PR does not merge or deploy automatically. GitHub-token-created PRs
+          may not trigger push/PR workflows: manually dispatch CI on this branch
+          or use a dedicated GitHub App if independently triggered PR checks are required.
+          BODY
+          printf '\nFull upstream comparison: https://github.com/CopilotKit/openmuse/compare/%s...%s\n' "$PREVIOUS_REVISION" "$REVISION" >> "$RUNNER_TEMP/upstream-pr.md"
+          printf '\nCandidate run: %s/%s/actions/runs/%s\n' "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID" >> "$RUNNER_TEMP/upstream-pr.md"
+          gh pr create --base "$BASE_BRANCH" --head "$branch" --title "chore: evaluate OpenMuse $REVISION" --body-file "$RUNNER_TEMP/upstream-pr.md"

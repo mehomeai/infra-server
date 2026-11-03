@@ -1,0 +1,45 @@
+name: Home API
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: home-api-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  home-api:
+    name: Home service and upstream suites
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      # Pins below reuse the SHAs already pinned in this repo's workflows
+      # (ci.yml / upstream-openmuse.yml); no new action versions invented.
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Set up the tested Node runtime
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: 24.18.0
+      - name: Run home unit suites (standalone, backend-absent safe)
+        # Standalone only: coordinator (home-coordinator.test.mjs) hard-imports
+        # ../../backend-server and is NOT run here; it requires the backend
+        # sibling and is covered by manual system-acceptance.yml with pinned
+        # SHAs. R2 (home-r2.test.mjs) self-skips honestly without the runtime
+        # sibling; it fails loudly only with ME_HOME_REQUIRE_R2=1 (system
+        # acceptance). Home unit must stay green when the backend is absent.
+        run: node --experimental-transform-types --disable-warning=ExperimentalWarning --test test/home-api.test.mjs test/home-h5.test.mjs test/home-h6.test.mjs test/home-notifications.test.mjs test/home-notifications-h71.test.mjs test/home-tasks.test.mjs test/home-r2.test.mjs
+      - name: Run the reused worker spike suite
+        run: npm run test:spike
+      - name: Run Python hygiene tests (system python3, no extra action)
+        run: python3 -m unittest discover -s scripts -p 'test_*.py' -v
+      - name: Verify imported source and attribution manifest
+        run: python3 scripts/upstream.py verify

@@ -1,0 +1,482 @@
+{
+  "openapi": "3.0.3",
+    "info": {
+    "title": "home-api-v1",
+    "version": "home-api-v1",
+    "description": "H1+H2+H3 household home service. Authoritative human-readable contract: contracts/home-api-v1.md."
+  },
+  "servers": [{ "url": "http://127.0.0.1:7070" }],
+  "components": {
+    "securitySchemes": {
+      "sessionToken": {
+        "type": "http",
+        "scheme": "bearer",
+        "bearerFormat": "ht1 opaque session token"
+      }
+    },
+    "schemas": {
+      "Error": {
+        "type": "object",
+        "required": ["error"],
+        "properties": {
+          "error": {
+            "type": "object",
+            "required": ["code", "message"],
+            "properties": {
+              "code": { "type": "string" },
+              "message": { "type": "string" }
+            }
+          }
+        }
+      },
+      "Device": {
+        "type": "object",
+        "required": ["id", "label", "created_at", "revoked_at"],
+        "properties": {
+          "id": { "type": "string" },
+          "label": { "type": "string" },
+          "created_at": { "type": "integer" },
+          "revoked_at": { "type": "integer", "nullable": true }
+        }
+      },
+      "Conversation": {
+        "type": "object",
+        "required": ["id", "owner_id", "title", "created_at", "updated_at"],
+        "properties": {
+          "id": { "type": "string" },
+          "owner_id": { "type": "string" },
+          "title": { "type": "string" },
+          "created_at": { "type": "integer" },
+          "updated_at": { "type": "integer" }
+        }
+      },
+      "Message": {
+        "type": "object",
+        "required": ["id", "conversation_id", "author_user_id", "role", "body", "created_at"],
+        "properties": {
+          "id": { "type": "string" },
+          "conversation_id": { "type": "string" },
+          "author_user_id": { "type": "string" },
+          "author_device_id": { "type": "string" },
+          "role": { "type": "string", "enum": ["user"] },
+          "body": { "type": "string" },
+          "request_key": { "type": "string", "format": "uuid", "nullable": true },
+          "task_id": { "type": "string", "nullable": true, "description": "Set on home-published assistant messages; rejected on public POST." },
+          "created_at": { "type": "integer" },
+          "duplicate": { "type": "boolean" }
+        }
+      },
+      "TaskSubmit": {
+        "type": "object",
+        "required": ["request"],
+        "properties": {
+          "request": { "type": "string", "maxLength": 8000 },
+          "title": { "type": "string", "maxLength": 200 },
+          "capabilities": {
+            "type": "object",
+            "properties": {
+              "files": { "type": "boolean" },
+              "web_fetch": { "type": "boolean" },
+              "browser": { "type": "boolean" },
+              "code_exec": { "type": "boolean" },
+              "animation": { "type": "boolean" },
+              "network_egress_allowlist": { "type": "array", "items": { "type": "string" } }
+            }
+          },
+          "budgets": {
+            "type": "object",
+            "properties": {
+              "max_steps": { "type": "integer" },
+              "max_wall_seconds": { "type": "integer" },
+              "max_tool_calls": { "type": "integer" }
+            }
+          }
+        }
+      },
+      "TaskView": {
+        "type": "object",
+        "required": ["id", "conversation_id", "title", "status", "created_at", "updated_at", "attempts"],
+        "properties": {
+          "id": { "type": "string" },
+          "conversation_id": { "type": "string" },
+          "title": { "type": "string" },
+          "status": {
+            "type": "string",
+            "enum": ["queued", "running", "succeeded", "failed", "cancelled", "waiting_input", "waiting_approval", "waiting_children"]
+          },
+          "created_at": { "type": "string" },
+          "updated_at": { "type": "string" },
+          "attempts": { "type": "integer" },
+          "parent_task_id": { "type": "string", "nullable": true },
+          "root_task_id": { "type": "string" },
+          "depth": { "type": "integer" },
+          "children": { "type": "array", "items": { "type": "string" } },
+          "children_status": { "type": "array", "items": { "type": "object" } },
+          "waiting_for": { "type": "array", "items": { "type": "string" } },
+          "error": { "type": "string" },
+          "question": { "type": "string" },
+          "questions": { "type": "array", "items": { "type": "object" } },
+          "pending_approvals": { "type": "array", "items": { "type": "object" } },
+          "output": { "type": "string" },
+          "artifacts": { "type": "array", "items": { "type": "object" } },
+          "progress": { "type": "array", "items": { "type": "object" } }
+        }
+      }
+    }
+  },
+  "paths": {
+    "/healthz": {
+      "get": {
+        "summary": "Liveness (anonymous)",
+        "responses": {
+          "200": { "description": "Minimal liveness; no auth." }
+        }
+      }
+    },
+    "/readyz": {
+      "get": {
+        "summary": "Readiness (anonymous)",
+        "responses": {
+          "200": { "description": "Storage reachable." },
+          "503": { "description": "Storage unavailable." }
+        }
+      }
+    },
+    "/v1/pair": {
+      "post": {
+        "summary": "Redeem pairing invitation",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["invitation_id", "invitation_secret"],
+                "properties": {
+                  "invitation_id": { "type": "string" },
+                  "invitation_secret": { "type": "string" },
+                  "device_label": { "type": "string" },
+                  "installation_id": { "type": "string" }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": { "description": "Device enrolled; invitation consumed atomically." },
+          "400": { "description": "Bad request." },
+          "403": { "description": "Wrong home or invalid secret." },
+          "404": { "description": "Unknown invitation." },
+          "410": { "description": "Expired or already consumed." },
+          "429": { "description": "Per-IP failed-attempt budget exceeded (Retry-After)." }
+        }
+      }
+    },
+    "/v1/sessions": {
+      "post": {
+        "summary": "Mint session token from device credential (no Bearer required)",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["device_id", "device_secret"],
+                "properties": {
+                  "device_id": { "type": "string" },
+                  "device_secret": { "type": "string" }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": { "description": "Session token issued." },
+          "401": { "description": "Unknown/revoked device or wrong secret." },
+          "429": { "description": "Per-IP failed-attempt budget exceeded (Retry-After)." }
+        }
+      }
+    },
+    "/v1/me": {
+      "get": {
+        "summary": "Session identity",
+        "security": [{ "sessionToken": [] }],
+        "responses": {
+          "200": { "description": "Session identity." }
+        }
+      }
+    },
+    "/v1/devices": {
+      "get": {
+        "summary": "List own devices",
+        "security": [{ "sessionToken": [] }],
+        "responses": {
+          "200": { "description": "Own devices without secrets." }
+        }
+      }
+    },
+    "/v1/devices/{id}/revoke": {
+      "post": {
+        "summary": "Revoke own device",
+        "security": [{ "sessionToken": [] }],
+        "parameters": [
+          { "in": "path", "name": "id", "required": true, "schema": { "type": "string" } }
+        ],
+        "responses": {
+          "200": { "description": "Revoked." },
+          "404": { "description": "Unknown or other-user device." }
+        }
+      }
+    },
+    "/v1/conversations": {
+      "get": {
+        "summary": "List own conversations",
+        "security": [{ "sessionToken": [] }],
+        "responses": {
+          "200": { "description": "Own conversations." },
+          "401": { "description": "Missing/invalid session." }
+        }
+      },
+      "post": {
+        "summary": "Create conversation",
+        "security": [{ "sessionToken": [] }],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "title": { "type": "string" }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": { "description": "Created." },
+          "401": { "description": "Missing/invalid session." }
+        }
+      }
+    },
+    "/v1/conversations/{id}": {
+      "get": {
+        "summary": "Get own conversation",
+        "security": [{ "sessionToken": [] }],
+        "parameters": [
+          { "in": "path", "name": "id", "required": true, "schema": { "type": "string" } }
+        ],
+        "responses": {
+          "200": { "description": "Conversation." },
+          "401": { "description": "Missing/invalid session." },
+          "404": { "description": "Unknown or other-user conversation." }
+        }
+      }
+    },
+    "/v1/conversations/{id}/messages": {
+      "get": {
+        "summary": "List messages",
+        "security": [{ "sessionToken": [] }],
+        "parameters": [
+          { "in": "path", "name": "id", "required": true, "schema": { "type": "string" } }
+        ],
+        "responses": {
+          "200": { "description": "Messages in created order." },
+          "401": { "description": "Missing/invalid session." },
+          "404": { "description": "Unknown or other-user conversation." }
+        }
+      },
+      "post": {
+        "summary": "Post user message (idempotent with request_key)",
+        "security": [{ "sessionToken": [] }],
+        "parameters": [
+          { "in": "path", "name": "id", "required": true, "schema": { "type": "string" } }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["body"],
+                "properties": {
+                  "body": { "type": "string", "maxLength": 20000 },
+                  "role": { "type": "string", "enum": ["user"] },
+                  "request_key": { "type": "string", "format": "uuid" }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": { "description": "Retry with same key and payload: original message, duplicate:true." },
+          "201": { "description": "Stored user message." },
+          "400": { "description": "Bad body, bad key, or unsupported role." },
+          "401": { "description": "Missing/invalid session." },
+          "404": { "description": "Unknown or other-user conversation." },
+          "409": { "description": "request_key already used with a different payload." }
+        }
+      }
+    },
+    "/v1/conversations/{id}/tasks": {
+      "get": {
+        "summary": "List tasks in own conversation",
+        "security": [{ "sessionToken": [] }],
+        "parameters": [
+          { "in": "path", "name": "id", "required": true, "schema": { "type": "string" } }
+        ],
+        "responses": {
+          "200": { "description": "Own tasks in this conversation." },
+          "404": { "description": "Unknown or other-user conversation." }
+        }
+      },
+      "post": {
+        "summary": "Submit task (model is home-selected; client model rejected)",
+        "security": [{ "sessionToken": [] }],
+        "parameters": [
+          { "in": "path", "name": "id", "required": true, "schema": { "type": "string" } }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/TaskSubmit" }
+            }
+          }
+        },
+        "responses": {
+          "201": { "description": "Task accepted; runs via the runtime bridge." },
+          "400": { "description": "Bad request, model_override_denied, or capability_denied." },
+          "404": { "description": "Unknown or other-user conversation." },
+          "503": { "description": "model_not_configured or runtime_not_configured: home cannot run tasks." }
+        }
+      }
+    },
+    "/v1/tasks/{id}": {
+      "get": {
+        "summary": "Task status, progress, inbox, and artifacts",
+        "security": [{ "sessionToken": [] }],
+        "parameters": [
+          { "in": "path", "name": "id", "required": true, "schema": { "type": "string" } }
+        ],
+        "responses": {
+          "200": { "description": "Task view." },
+          "404": { "description": "Unknown or other-user task." }
+        }
+      }
+    },
+    "/v1/tasks/{id}/cancel": {
+      "post": {
+        "summary": "Cancel task and terminate its runtime child",
+        "security": [{ "sessionToken": [] }],
+        "parameters": [
+          { "in": "path", "name": "id", "required": true, "schema": { "type": "string" } }
+        ],
+        "responses": {
+          "200": { "description": "Cancelled." },
+          "404": { "description": "Unknown or other-user task." },
+          "409": { "description": "Task already settled." }
+        }
+      }
+    },
+    "/v1/tasks/{id}/inputs": {
+      "post": {
+        "summary": "Answer waiting_input questions and resume",
+        "security": [{ "sessionToken": [] }],
+        "parameters": [
+          { "in": "path", "name": "id", "required": true, "schema": { "type": "string" } }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["inputs"],
+                "properties": {
+                  "inputs": {
+                    "type": "array",
+                    "items": {
+                      "type": "object",
+                      "required": ["id", "answer"],
+                      "properties": {
+                        "id": { "type": "string" },
+                        "answer": { "type": "string", "maxLength": 4000 }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": { "description": "Accepted; run resumes." },
+          "400": { "description": "Unknown question or bad answer." },
+          "404": { "description": "Unknown or other-user task." },
+          "409": { "description": "Task is not waiting for input." }
+        }
+      }
+    },
+    "/v1/tasks/{id}/approvals": {
+      "post": {
+        "summary": "Decide awaiting_approval items and resume (public IDs are <taskId>:<runtimeId>)",
+        "security": [{ "sessionToken": [] }],
+        "parameters": [
+          { "in": "path", "name": "id", "required": true, "schema": { "type": "string" } }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["approvals"],
+                "properties": {
+                  "approvals": {
+                    "type": "array",
+                    "items": {
+                      "type": "object",
+                      "required": ["id", "decision"],
+                      "properties": {
+                        "id": { "type": "string" },
+                        "decision": { "type": "string", "enum": ["approve", "reject"] },
+                        "note": { "type": "string", "maxLength": 1000 }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": { "description": "Accepted; run resumes or fails honestly on reject." },
+          "400": { "description": "Unknown approval or bad decision." },
+          "404": { "description": "Unknown or other-user task." },
+          "409": { "description": "Task is not awaiting approval." }
+        }
+      }
+    },
+    "/v1/tasks/{id}/artifacts": {
+      "get": {
+        "summary": "List artifact metadata for own task",
+        "security": [{ "sessionToken": [] }],
+        "parameters": [
+          { "in": "path", "name": "id", "required": true, "schema": { "type": "string" } }
+        ],
+        "responses": {
+          "200": { "description": "Artifact metadata (no bytes, no paths)." },
+          "404": { "description": "Unknown or other-user task." }
+        }
+      }
+    },
+    "/v1/tasks/{id}/artifacts/{artifactId}": {
+      "get": {
+        "summary": "Download artifact bytes",
+        "security": [{ "sessionToken": [] }],
+        "parameters": [
+          { "in": "path", "name": "id", "required": true, "schema": { "type": "string" } },
+          { "in": "path", "name": "artifactId", "required": true, "schema": { "type": "string" } }
+        ],
+        "responses": {
+          "200": { "description": "application/octet-stream bytes from home storage." },
+          "404": { "description": "Unknown task/artifact or other-user task." }
+        }
+      }
+    }
+  }
+}

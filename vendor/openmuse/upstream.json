@@ -1,0 +1,11 @@
+{
+  "schema": 1,
+  "repository": "CopilotKit/openmuse",
+  "branch": "main",
+  "revision": "a4944f4c471d3dc93b8bfc060b5da309b5216ab2",
+  "files": {
+    "LICENSE": "399a9cccf1b228c9e8ad348ef66a0a5802d438d46735d0d068390925aee5ee36",
+    "apps/server/src/log.ts": "9debacc65d2da0fb12fa2861f1ae77e0343ec285d74a19e0d1c1b7e1fbf44337",
+    "apps/server/src/engine/worker.ts": "769ccdc02e3c5aa14c729cf0f6d745d408d4089e932dcdca71c5b36077642195"
+  }
+}
