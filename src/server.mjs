@@ -31,6 +31,12 @@ import {
 } from './upstream-proxy.mjs';
 import { doctorCachePath } from './upstream-doctor.mjs';
 import { createLiveTracker } from './upstream-live.mjs';
+import {
+  parseCorsAllowedOrigins,
+  corsMatchOrigin,
+  handleCorsPreflight,
+  applyCorsHeaders,
+} from './cors.mjs';
 import { submitToUpstream } from './upstream-full.mjs';
 
 export const CONTRACT_VERSION = 'home-api-v1';
@@ -271,6 +277,9 @@ function storeMessage(db, conv, session, body) {
 }
 
 export function createHomeServer({ dbPath, broker: brokerOverrides = {}, rateLimit: rateLimitOverrides, env = process.env, notifications: notificationOverrides = {}, coordinator: coordinatorOverrides = {}, upstreamFetch = fetch, liveIntervalMs = 120_000, liveTtlMs = null, liveFullIntervalMs = null, liveKick = true } = {}) {
+  // Exact-origin CORS allowlist from ME_CORS_ALLOWED_ORIGINS; unset = no
+  // CORS headers (fail-closed). Throws on a malformed entry.
+  const corsAllowedOrigins = parseCorsAllowedOrigins(env.ME_CORS_ALLOWED_ORIGINS);
   const { db, installationId } = openHomeDb(dbPath);
   // H8 coordinator (disabled by default): consumes the S7-written private
   // credentials file and heartbeats the hosted backend. No outbound network
@@ -372,6 +381,13 @@ export function createHomeServer({ dbPath, broker: brokerOverrides = {}, rateLim
   }
 
   async function handle(req, res) {
+    // CORS outermost layer: preflights are answered here (before auth, so
+    // a browser can negotiate without a session); for an allowlisted
+    // origin the grant headers are stamped before routing so every
+    // response — including 401/403/404 errors — carries them.
+    if (handleCorsPreflight(req, res, corsAllowedOrigins)) return;
+    applyCorsHeaders(res, corsMatchOrigin(req, corsAllowedOrigins));
+
     const url = new URL(req.url, 'http://localhost');
     const { pathname } = url;
     const method = req.method;
