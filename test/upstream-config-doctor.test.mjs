@@ -389,6 +389,8 @@ test('verifyDeployedCheckout: git footprint + hashes, not markers alone', async 
   for (const [name, content] of Object.entries(lockFiles)) {
     lock.files[name] = createHash('sha256').update(content).digest('hex');
   }
+  const indexPost = `${lockFiles['server/src/index.ts']}\nwrapAuthWithHomeBridge(homeAuth`;
+  const bridgeContent = 'wrapAuthWithHomeBridge ME_HOME_BRIDGE_SECRET timingSafeEqual';
   const seed = async () => {
     await rm(dir, { recursive: true, force: true });
     await mkdir(join(dir, 'server/src'), { recursive: true });
@@ -396,48 +398,152 @@ test('verifyDeployedCheckout: git footprint + hashes, not markers alone', async 
     for (const [name, content] of Object.entries(lockFiles)) {
       await writeFile(join(dir, name), content);
     }
+    // Unmodified seam: tracked, outside the lock allowlist, pinned only
+    // by the patch manifest's unmodified map.
+    await writeFile(join(dir, 'server/src/request-actor.ts'), 'actor-src');
     execFileSync('git', ['-C', dir, 'add', '-A']);
     execFileSync('git', ['-C', dir, '-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-qm', 'base']);
     lock.revision = execFileSync('git', ['-C', dir, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
     // Approved footprint: uncommitted patch changes only.
-    await writeFile(join(dir, 'server/src/index.ts'), `${lockFiles['server/src/index.ts']}\nwrapAuthWithHomeBridge(homeAuth`);
-    await writeFile(join(dir, 'server/src/home-bridge.ts'), 'wrapAuthWithHomeBridge ME_HOME_BRIDGE_SECRET timingSafeEqual');
+    await writeFile(join(dir, 'server/src/index.ts'), indexPost);
+    await writeFile(join(dir, 'server/src/home-bridge.ts'), bridgeContent);
   };
+  // Schema-1 patch manifest for the seeded fixture (F shape:
+  // {files: {path: {originalSha256, postSha256}}, unmodified: {path: sha}}).
+  // config.ts is unmodified in this fixture, so its post bytes equal its
+  // base bytes; index.ts carries the real post-patch content.
+  const fixtureManifest = () => ({
+    schema: 1,
+    repository: 'CopilotKit/OpenBot',
+    baseCommit: lock.revision,
+    files: {
+      'server/src/index.ts': { originalSha256: lock.files['server/src/index.ts'], postSha256: createHash('sha256').update(indexPost).digest('hex') },
+      'server/src/config.ts': { originalSha256: lock.files['server/src/config.ts'], postSha256: lock.files['server/src/config.ts'] },
+      'server/src/home-bridge.ts': { originalSha256: null, postSha256: createHash('sha256').update(bridgeContent).digest('hex') },
+    },
+    unmodified: { 'server/src/request-actor.ts': createHash('sha256').update('actor-src').digest('hex') },
+  });
   assert.deepEqual(verifyDeployedCheckout(join(dir, 'nope'), lock).missing, true);
   execFileSync('git', ['init', '-q', join(dir, 'empty')]);
   await mkdir(join(dir, 'empty'), { recursive: true });
   assert.equal(verifyDeployedCheckout(join(dir, 'empty'), lock).ok, false);
   await seed();
-  const ok = verifyDeployedCheckout(dir, lock);
+  const manifest = fixtureManifest();
+  const ok = verifyDeployedCheckout(dir, lock, { manifest });
   assert.equal(ok.ok, true);
   assert.equal(ok.report.patchApplied, true);
   assert.equal(ok.report.filesOk, 2, 'only non-seam lock files are hash-checked');
+  assert.equal(ok.report.manifestOk, 3, 'every manifest-pinned patched file post-hash checked');
+  assert.equal(ok.report.manifestUnmodifiedOk, 1, 'unmodified seam digest checked');
+  // The patch manifest is REQUIRED: no manifest, no verification — the
+  // structural rules + markers alone never prove post-patch bytes.
+  const noManifest = verifyDeployedCheckout(dir, lock);
+  assert.equal(noManifest.ok, false);
+  assert.match(noManifest.reason, /patch manifest missing.*never optional/);
+  // The pre-v3 plain-string manifest shape is refused, not mis-parsed.
+  const stringManifest = verifyDeployedCheckout(dir, lock, {
+    manifest: { files: { 'server/src/index.ts': 'x', 'server/src/config.ts': 'y', 'server/src/home-bridge.ts': 'z' } },
+  });
+  assert.equal(stringManifest.ok, false);
+  assert.match(stringManifest.reason, /not the \{originalSha256, postSha256\} schema/);
+  // Every approved seam file must be pinned by the manifest.
+  const { 'server/src/config.ts': _drop, ...unpinnedFiles } = manifest.files;
+  const unpinned = verifyDeployedCheckout(dir, lock, { manifest: { ...manifest, files: unpinnedFiles } });
+  assert.equal(unpinned.ok, false);
+  assert.match(unpinned.reason, /not pinned by trusted patch manifest/);
   // Tampered non-seam tracked file => drift, even though markers are intact.
   await writeFile(join(dir, 'server/src/app.ts'), 'tampered');
-  const drift = verifyDeployedCheckout(dir, lock);
+  const drift = verifyDeployedCheckout(dir, lock, { manifest });
   assert.equal(drift.ok, false);
   assert.match(drift.reason, /drift/);
   // Unapproved new source file => drift.
   await writeFile(join(dir, 'server/src/app.ts'), lockFiles['server/src/app.ts']);
   await writeFile(join(dir, 'server/src/evil.ts'), 'nope');
-  const added = verifyDeployedCheckout(dir, lock);
+  const added = verifyDeployedCheckout(dir, lock, { manifest });
   assert.equal(added.ok, false);
   assert.match(added.reason, /unapproved new source file/);
   await rm(join(dir, 'server/src/evil.ts'));
-  // Missing markers corroborate refusal.
+  // Tampered unmodified seam file => drift (git footprint refuses first;
+  // the manifest digest is the byte-proof backstop).
+  await writeFile(join(dir, 'server/src/request-actor.ts'), 'tampered');
+  const seamDrift = verifyDeployedCheckout(dir, lock, { manifest });
+  assert.equal(seamDrift.ok, false);
+  assert.match(seamDrift.reason, /drift/);
+  await writeFile(join(dir, 'server/src/request-actor.ts'), 'actor-src');
+  // Missing markers corroborate refusal (post-hash mismatch fires first).
   await writeFile(join(dir, 'server/src/home-bridge.ts'), 'no markers');
-  const unpatched = verifyDeployedCheckout(dir, lock);
+  const unpatched = verifyDeployedCheckout(dir, lock, { manifest });
   assert.equal(unpatched.ok, false);
-  // Trusted post-hash manifest enforced exactly when present.
-  await writeFile(join(dir, 'server/src/home-bridge.ts'), 'wrapAuthWithHomeBridge ME_HOME_BRIDGE_SECRET timingSafeEqual');
-  const indexHash = createHash('sha256').update(await import('node:fs/promises').then((fs) => fs.readFile(join(dir, 'server/src/index.ts')))).digest('hex');
-  const manifestOk = verifyDeployedCheckout(dir, lock, { manifest: { files: { 'server/src/index.ts': indexHash } } });
-  assert.equal(manifestOk.ok, true);
-  assert.equal(manifestOk.report.manifestOk, 1);
-  await writeFile(join(dir, 'server/src/index.ts'), `${lockFiles['server/src/index.ts']}\nwrapAuthWithHomeBridge(homeAuth\n// extra`);
-  const manifestBad = verifyDeployedCheckout(dir, lock, { manifest: { files: { 'server/src/index.ts': indexHash } } });
+  // Tampered post-patch file => exact post-hash refusal.
+  await writeFile(join(dir, 'server/src/home-bridge.ts'), bridgeContent);
+  await writeFile(join(dir, 'server/src/index.ts'), `${indexPost}\n// extra`);
+  const manifestBad = verifyDeployedCheckout(dir, lock, { manifest });
   assert.equal(manifestBad.ok, false);
-  assert.match(manifestBad.reason, /trusted patch manifest/);
+  assert.match(manifestBad.reason, /trusted patch manifest post-hash/);
+});
+
+test('loadPatchManifest: real manifest loads; missing or tampered fails closed', async (t) => {
+  const { loadPatchManifest } = await import('../src/upstream-doctor.mjs');
+  const { mkdtemp, rm, mkdir, writeFile, copyFile } = await import('node:fs/promises');
+  // The installed release manifest + patch verify as shipped.
+  const real = loadPatchManifest(process.cwd());
+  assert.equal(real.ok, true);
+  assert.equal(real.manifest.files['server/src/config.ts'].postSha256.length, 64);
+  assert.equal(real.manifest.unmodified['server/src/auth/guards.ts'].length, 64);
+  const root = await mkdtemp(join(tmpdir(), 'me-manifest-'));
+  t.after(async () => { await rm(root, { recursive: true, force: true }); });
+  // Missing manifest is a refusal, never a silent structural-only pass.
+  const missing = loadPatchManifest(root);
+  assert.equal(missing.ok, false);
+  assert.match(missing.reason, /missing or unreadable.*never optional/);
+  // Tampered vendored patch file (digest != manifest patchSha256).
+  await mkdir(join(root, 'vendor/openbot/patches'), { recursive: true });
+  await copyFile(join(process.cwd(), 'vendor/openbot/patches/manifest.json'), join(root, 'vendor/openbot/patches/manifest.json'));
+  await writeFile(join(root, 'vendor/openbot/patches/0001-home-identity-bridge.patch'), 'tampered patch bytes');
+  const tampered = loadPatchManifest(root);
+  assert.equal(tampered.ok, false);
+  assert.match(tampered.reason, /tampered/);
+});
+
+test('doctor report carries the versioned full-evidence contract marker', async () => {
+  const fetchImpl = async (url, init) => {
+    if (String(url).endsWith('/health')) return { json: async () => ({ status: 'ok', docker: true }) };
+    if (String(url).endsWith('/computers')) return { ok: true, json: async () => ({ computers: [] }) };
+    throw new Error(`unexpected ${url}`);
+  };
+  const report = await checkUpstreamPlatform({ env: { ...CORE_ENV }, fetchImpl, repoRoot: process.cwd() });
+  assert.equal(report.state, 'READY');
+  // C's supervisor refuses any report without this exact marker
+  // (top-level or checks.doctor_contract); the doctor stamps both.
+  assert.equal(report.doctor_contract, 'upstream-platform-v1/full.1');
+  assert.equal(report.checks.doctor_contract, 'upstream-platform-v1/full.1');
+  // The nested evidence the marker vouches for is produced by the checks.
+  assert.equal(report.checks.sourcePin.ref, '6bfee780c8e8d05141375ea55ebde33eefb3dbc0');
+  assert.ok(report.checks.sourcePin.files > 0);
+  assert.equal(report.checks.upstream.repo, 'CopilotKit/OpenBot');
+  assert.equal(report.checks.upstream.ref, '6bfee780c8e8d05141375ea55ebde33eefb3dbc0');
+});
+
+test('missing patch manifest fails the deployed check closed (never optional)', async (t) => {
+  const { mkdtemp, rm, mkdir, copyFile } = await import('node:fs/promises');
+  const { execFileSync } = await import('node:child_process');
+  // A release root with the vendor lock but NO patches/manifest.json.
+  const root = await mkdtemp(join(tmpdir(), 'me-nomanifest-'));
+  t.after(async () => { await rm(root, { recursive: true, force: true }); });
+  await mkdir(join(root, 'vendor/openbot'), { recursive: true });
+  await copyFile(join(process.cwd(), 'vendor/openbot/upstream.json'), join(root, 'vendor/openbot/upstream.json'));
+  const checkout = await mkdtemp(join(tmpdir(), 'me-nomanifest-co-'));
+  t.after(async () => { await rm(checkout, { recursive: true, force: true }); });
+  execFileSync('git', ['init', '-q', checkout]);
+  const report = await checkUpstreamPlatform({
+    env: fullEnv({ OPENBOT_CHECKOUT: checkout }),
+    fetchImpl: okFetch(), probe: true,
+    sdkClient: class { async getRuntimeEntitlements() { return { status: 'ready', entitlement: { active: true } }; } },
+    repoRoot: root,
+  });
+  assert.equal(report.state, 'FAILED');
+  assert.ok(report.checks.failures.some((f) => /patch manifest missing or unreadable/.test(f)), 'names the manifest refusal');
+  assert.equal(report.checks.sourcePin.deployed.manifestOk, false);
 });
 
 test('privacy gates: upstream push text, telemetry on, world-writable storage are FAILED', async (t) => {

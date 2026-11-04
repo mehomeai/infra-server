@@ -1,6 +1,10 @@
 // Independent upstream-platform-v1 stack doctor (FULL primary).
 //
-// Protocol: { protocol:'upstream-platform-v1', state:'READY'|'NEEDS_INPUT'|'FAILED', checks:{...} }
+// Protocol: { protocol:'upstream-platform-v1', doctor_contract:'upstream-platform-v1/full.1', state:'READY'|'NEEDS_INPUT'|'FAILED', checks:{...} }
+// The doctor_contract marker (also checks.doctor_contract) is the versioned
+// full-evidence contract the setup supervisor requires; it is stamped on
+// every report, and READY additionally requires every evidence field the
+// checks below produce (see results/setup-doctor-contract.json).
 // - READY (core): computer plane verified (pin, supervisor auth, per-user boundary).
 // - READY (full): ALL required components verified: pin + server /health +
 //   Postgres binding + supervisor auth/list + computer plane + self-hosted
@@ -21,6 +25,10 @@ import { dirname, join } from 'node:path';
 import { createSupervisorClient, checkUpstreamId } from './upstream-computer.mjs';
 import { resolveUpstreamConfig, gateFullConfig, UPSTREAM_PIN, UPSTREAM_REPO } from './upstream-config.mjs';
 import { resolveModelConfig, resolveNativeModelConfig } from './runtime-config.mjs';
+import {
+  probeUpstreamHealth, probeCapabilities, probeNativeAuth, probeModelServed,
+  DOCTOR_PROBE_IDENTITY,
+} from './upstream-probes.mjs';
 import { readFile, stat } from 'node:fs/promises';
 
 // Pinned SDK the production host uses for the authenticated entitlement
@@ -50,6 +58,62 @@ async function readLock(checkoutOrRepo = null) {
   } catch {
     return null;
   }
+}
+
+// Versioned full-evidence contract marker (setup-doctor-contract /
+// setup-wire-contract): the supervisor (C) accepts a live doctor report
+// only when it carries this marker, top-level or as checks.doctor_contract,
+// AND every required evidence field with verified values. Fail-closed
+// until present, so the doctor stamps it on every report it produces.
+export const DOCTOR_CONTRACT = 'upstream-platform-v1/full.1';
+
+// Trusted patch manifest (F-owned): the ONLY authority for post-patch
+// bytes. It lives with the patches in the installed release
+// (vendor/openbot/patches/manifest.json, schema 1:
+// {files: {path: {originalSha256, postSha256}}, unmodified: {path: sha256}},
+// byte-verified by apply.sh; see patch-auth-v3). Loading is fail-closed:
+// a missing, unreadable, malformed or tampered manifest is a verification
+// failure, never a silent downgrade to structural-only checks.
+export const PATCH_MANIFEST_PATH = 'vendor/openbot/patches/manifest.json';
+const SHA256_HEX = /^[0-9a-f]{64}$/;
+
+export function loadPatchManifest(root) {
+  const failLoad = (reason) => ({ ok: false, reason });
+  let raw;
+  try {
+    raw = readFileSyncCache(join(root, PATCH_MANIFEST_PATH), 'utf8');
+  } catch {
+    return failLoad(`trusted patch manifest missing or unreadable: ${PATCH_MANIFEST_PATH} (required; post-hash verification is never optional)`);
+  }
+  let manifest;
+  try {
+    manifest = JSON.parse(raw);
+  } catch {
+    return failLoad(`trusted patch manifest is not valid JSON: ${PATCH_MANIFEST_PATH}`);
+  }
+  if (!manifest || typeof manifest !== 'object' || Array.isArray(manifest)) {
+    return failLoad('trusted patch manifest is not a JSON object');
+  }
+  if (manifest.schema !== 1 || manifest.repository !== UPSTREAM_REPO) {
+    return failLoad(`trusted patch manifest identity mismatch: expected schema 1 for ${UPSTREAM_REPO}`);
+  }
+  if (typeof manifest.patch !== 'string' || !manifest.patch || manifest.patch.includes('/')
+    || typeof manifest.patchSha256 !== 'string' || !SHA256_HEX.test(manifest.patchSha256)) {
+    return failLoad('trusted patch manifest lacks a pinned patch file digest');
+  }
+  // The vendored patch file itself must match the manifest (tamper proof,
+  // the same check apply.sh performs before applying anything).
+  let patchBytes;
+  try {
+    patchBytes = readFileSyncCache(join(root, 'vendor/openbot/patches', manifest.patch));
+  } catch {
+    return failLoad(`vendored patch file missing: vendor/openbot/patches/${manifest.patch}`);
+  }
+  const patchDigest = createHash('sha256').update(patchBytes).digest('hex');
+  if (patchDigest !== manifest.patchSha256) {
+    return failLoad(`vendored patch file tampered: sha256 ${patchDigest} != manifest patchSha256`);
+  }
+  return { ok: true, manifest };
 }
 
 function serverBase(env) {
@@ -219,26 +283,35 @@ async function checkFullNative({ env, fetchImpl, checks, need, fail, probe, sdkC
   const sfetch = secretFetch(fetchImpl);
   let serverOk = false;
   if (probe) {
-    try {
-      const res = await sfetch(`${base}/health`, { signal: AbortSignal.timeout(8000) });
-      const body = await boundedJson(res).catch(() => null);
-      checks.upstreamServer = { url: base, health: body };
-      if (!res.ok || body?.status !== 'ok') fail(`upstream server /health did not answer {status:ok} at ${base}`);
-      else {
-        const caps = await sfetch(`${base}/api/capabilities`, { signal: AbortSignal.timeout(8000) });
-        const capsBody = await boundedJson(caps).catch(() => null);
-        if (!caps.ok || capsBody?.mode == null || capsBody?.durableHistory == null) {
+    // Shared probe set (upstream-probes.mjs): the same /health +
+    // /api/capabilities questions the live tracker's FULL tier asks. The
+    // doctor keeps verdict ownership: answered-but-bad health is FAILED,
+    // an unreachable server is NEEDS_INPUT, capabilities drift is FAILED.
+    // (The doctor's base comes from serverBase above, not the shared
+    // module's private-address-validating resolver: the doctor reports on
+    // whatever is configured, it does not refuse non-private bases.)
+    const health = await probeUpstreamHealth({ base, fetchImpl });
+    if (!health.ok && health.error != null) {
+      need(`upstream server unreachable at ${base}: ${health.error} (start pinned stack; see docs/upstream-deployment.md)`);
+      checks.upstreamServer = { url: base, reachable: false };
+    } else {
+      checks.upstreamServer = { url: base, health: health.body ?? null };
+      if (!health.ok) {
+        fail(`upstream server /health did not answer {status:ok} at ${base}`);
+      } else {
+        const caps = await probeCapabilities({ base, fetchImpl });
+        if (!caps.ok && caps.reason === 'unreachable') {
+          need(`upstream server unreachable at ${base}: ${caps.error} (start pinned stack; see docs/upstream-deployment.md)`);
+          checks.upstreamServer = { url: base, reachable: false };
+        } else if (!caps.ok) {
           fail(`upstream server /api/capabilities missing required projection at ${base} (drift?)`);
         } else {
           checks.upstreamServer.capabilities = {
-            mode: capsBody.mode, durableHistory: capsBody.durableHistory,
+            mode: caps.mode, durableHistory: caps.durableHistory,
           };
           serverOk = true;
         }
       }
-    } catch (error) {
-      need(`upstream server unreachable at ${base}: ${error.message} (start pinned stack; see docs/upstream-deployment.md)`);
-      checks.upstreamServer = { url: base, reachable: false };
     }
   } else {
     checks.upstreamServer = { url: base, probed: false };
@@ -260,50 +333,32 @@ async function checkFullNative({ env, fetchImpl, checks, need, fail, probe, sdkC
       need('full: ME_HOME_BRIDGE_SECRET missing (cannot run the native auth probes)');
       checks.nativeAuth = { probed: false };
     } else {
-      try {
-        const { signHomeAssertion, ASSERTION_HEADER } = await import('./upstream-proxy.mjs');
-        const sign = (role) => signHomeAssertion({ upstreamUserId: 'me-doctor-probe', role, bridgeSecret });
-        const get = (path, role) => sfetch(`${base}${path}`, {
-          headers: { [ASSERTION_HEADER]: sign(role) },
-          signal: AbortSignal.timeout(8000),
-        });
-        checks.nativeAuth = { probed: true };
-        const agents = await get('/api/agents', 'user');
-        const agentsBody = await boundedJson(agents).catch(() => null);
-        if (agents.status === 401 || agents.status === 403) {
-          fail('full: native auth probe refused (401/403): home-bridge patch missing or bridge secret mismatch on the upstream host');
-          checks.nativeAuth.authenticated = false;
-        } else if (!agents.ok || !Array.isArray(agentsBody?.agents)) {
-          fail(`full: native agents roster unreadable (${agents.status}): product DB schema or deployment drift?`);
-          checks.nativeAuth.authenticated = true;
-        } else {
-          checks.nativeAuth.authenticated = true;
-          checks.nativeAuth.agents = agentsBody.agents.length;
-          checks.nativeAuth.perPersonRoster = true;
-        }
-        const fleet = await get('/api/computers/fleet', 'admin');
-        const fleetBody = await boundedJson(fleet).catch(() => null);
-        if (fleet.status === 401 || fleet.status === 403) {
-          fail('full: fleet admin probe refused (401/403): patch or admin mapping misconfigured on the upstream host');
-        } else if (!fleet.ok || !Array.isArray(fleetBody?.computers) || typeof fleetBody?.isolation === 'undefined') {
-          fail(`full: fleet probe unreadable (${fleet.status}): computer provider or schema drift?`);
-        } else {
-          checks.nativeAuth.fleet = {
-            computers: fleetBody.computers.length, isolation: fleetBody.isolation ?? null,
-            personKeys: fleetBody.computers.filter((c) => c?.kind === 'person' || typeof c?.personId === 'string').length,
-          };
-          const userFleet = await get('/api/computers/fleet', 'user');
-          await boundedJson(userFleet).catch(() => null);
-          if (userFleet.status === 403 || userFleet.status === 401) {
-            checks.nativeAuth.roleGate = 'user-denied';
-            checks.nativeAuth.perPerson = true;
-          } else {
-            fail(`full: shared provider answered fleet to a user assertion (${userFleet.status}): per-person computer isolation is not enforced`);
-          }
-        }
-      } catch (error) {
-        need(`full: native auth probe unreadable: ${error.message}`);
+      // Shared probe set (upstream-probes.mjs probeNativeAuth) under the
+      // doctor identity: the same signed reads the live tracker's FULL
+      // tier runs. The doctor maps each stage outcome to its own
+      // verdicts/messages below; the shared probe stops at the first
+      // failure (verdict-identical: any stage failure already bars
+      // READY), where the old inline flow also probed the remaining
+      // stages for extra diagnostics.
+      const auth = await probeNativeAuth({ base, bridgeSecret, fetchImpl, identity: DOCTOR_PROBE_IDENTITY });
+      if (auth.ok) {
+        checks.nativeAuth = auth.check;
+      } else if (auth.reason === 'unreachable') {
+        need(`full: ${auth.detail}`);
         checks.nativeAuth = { probed: true, authenticated: false };
+      } else {
+        checks.nativeAuth = auth.check;
+        if (auth.stage === 'agents' && auth.reason === 'auth') {
+          fail('full: native auth probe refused (401/403): home-bridge patch missing or bridge secret mismatch on the upstream host');
+        } else if (auth.stage === 'agents') {
+          fail(`full: native agents roster unreadable (${auth.status}): product DB schema or deployment drift?`);
+        } else if (auth.stage === 'fleet' && auth.reason === 'auth') {
+          fail('full: fleet admin probe refused (401/403): patch or admin mapping misconfigured on the upstream host');
+        } else if (auth.stage === 'fleet') {
+          fail(`full: fleet probe unreadable (${auth.status}): computer provider or schema drift?`);
+        } else if (auth.stage === 'fleet-user') {
+          fail(`full: shared provider answered fleet to a user assertion (${auth.status}): per-person computer isolation is not enforced`);
+        }
       }
     }
   } else if (probe) {
@@ -396,6 +451,15 @@ async function checkFullNative({ env, fetchImpl, checks, need, fail, probe, sdkC
     checks.model = { provider: model.provider, model: model.model, endpoint: model.endpoint, keyEnv: model.keyEnv, keyPresent: Boolean(model.key) };
     if (!probe) checks.model.probed = false;
     else if (model.localRoute) {
+      // LOCAL route stays doctor-local BY DESIGN (not the shared probe):
+      // probeModelServed's local route is namespace-gated for the live
+      // tracker (a host-side answer alone is never READY there), while
+      // the doctor is a host-namespace CLI whose /api/tags proof has
+      // always been host proof (docs/readiness-handshake-design.md
+      // §1.4); it also surfaces the endpoint's HTTP status / error text
+      // in its NEEDS_INPUT messages, which the shared namespace walk
+      // deliberately collapses. Unifying would change one side's
+      // pinned verdict semantics.
       try {
         const res = await sfetch(`${model.endpoint}/api/tags`, { signal: AbortSignal.timeout(8000) });
         const body = await boundedJson(res).catch(() => null);
@@ -409,55 +473,32 @@ async function checkFullNative({ env, fetchImpl, checks, need, fail, probe, sdkC
         need(`full: local model unreachable at ${model.endpoint} (start Ollama or check OPENAI_BASE_URL): ${error.message}`);
         checks.model.reachable = false;
       }
-    } else if (model.provider === 'openai' || model.provider === 'anthropic') {
-      if (!model.key) {
-        need(`full: ${model.keyEnv} missing (native ${model.provider} key required; no inference without it)`);
-      } else {
-        try {
-          const isAnthropic = model.provider === 'anthropic';
-          const res = await sfetch(`${model.endpoint}${isAnthropic ? '/v1/models' : '/models'}`, {
-            headers: isAnthropic
-              ? { 'x-api-key': model.key, 'anthropic-version': '2023-06-01' }
-              : { authorization: `Bearer ${model.key}` },
-            signal: AbortSignal.timeout(8000),
-          });
-          const body = await boundedJson(res).catch(() => null);
-          if (res.status === 401 || res.status === 403) fail(`full: native ${model.provider} key rejected (401/403)`);
-          else if (!res.ok) need(`full: native ${model.provider} models endpoint answered ${res.status}`);
-          else {
-            const ids = Array.isArray(body?.data) ? body.data.map((m) => m?.id).filter(Boolean) : [];
-            checks.model.served = ids.slice(0, 12);
-            if (!ids.includes(model.model)) need(`full: selected model ${model.model} not in ${model.provider} list (set BOT_MODEL to the exact model id)`);
-            else checks.model.selectedServed = true;
-          }
-        } catch (error) {
-          need(`full: native ${model.provider} models list unreachable: ${error.message}`);
-        }
+    } else {
+      // Remote provider routes (openai / anthropic / google) share ONE
+      // implementation with the live tracker (upstream-probes.mjs
+      // probeModelServed: provider list read, exact-id match, list-only
+      // metadata, no namespace gate — the harness calls the provider API
+      // directly). The shared detail strings are the doctor's own
+      // messages (lifted verbatim), re-prefixed here; the doctor maps
+      // key rejection (401/403) to FAILED and every other shortfall to
+      // NEEDS_INPUT, exactly as its inline probes did. The shared check
+      // additively records namespace:'host' (evidence completeness).
+      const served = await probeModelServed({ env, fetchImpl });
+      checks.model = {
+        ...served.check,
+        note: 'native harness model; list-only metadata check, no inference spend; scoped prompt/history only, never household store to vendor',
+      };
+      if (!served.ok) {
+        // Doctor report schema (its own, supervisor-validated): a failed
+        // model probe records no selectedServed/namespace verdict fields
+        // at all — absence is the failure signal, as the inline probes
+        // always emitted. (On success the shared namespace:'host' is
+        // kept as additive evidence.)
+        delete checks.model.selectedServed;
+        delete checks.model.namespace;
+        if (served.status === 401 || served.status === 403) fail(`full: ${served.detail}`);
+        else need(`full: ${served.detail}`);
       }
-      checks.model.note = 'native harness model; list-only metadata check, no inference spend; scoped prompt/history only, never household store to vendor';
-    } else if (model.provider === 'google') {
-      if (!model.key) {
-        need('full: GOOGLE_API_KEY missing (native google key required; no inference without it)');
-      } else {
-        try {
-          const res = await sfetch(`${model.endpoint}/v1beta/models?key=${encodeURIComponent(model.key)}`, {
-            signal: AbortSignal.timeout(8000),
-          });
-          const body = await boundedJson(res).catch(() => null);
-          if (res.status === 401 || res.status === 403) fail('full: native google key rejected (401/403)');
-          else if (!res.ok) need(`full: native google models endpoint answered ${res.status}`);
-          else {
-            const ids = Array.isArray(body?.models) ? body.models.map((m) => m?.name).filter(Boolean) : [];
-            checks.model.served = ids.slice(0, 12);
-            const served = ids.some((id) => id === model.model || id === `models/${model.model}`);
-            if (!served) need(`full: selected model ${model.model} not in google list (set BOT_MODEL to the exact model id)`);
-            else checks.model.selectedServed = true;
-          }
-        } catch (error) {
-          need(`full: native google models list unreachable: ${error.message}`);
-        }
-      }
-      checks.model.note = 'native harness model; list-only metadata check, no inference spend; scoped prompt/history only, never household store to vendor';
     }
   } catch (error) {
     fail(`full: native model misconfigured (${error.message}); set BOT_PROVIDER + BOT_MODEL + provider key`);
@@ -584,9 +625,17 @@ export function readLiveEvidence(cachePath, { at = Date.now(), fs = null } = {})
 //      drift or unapproved new source file is a FAILED refusal.
 //   3. Every lock file's LOCAL sha256 must match, EXCEPT the approved
 //      modified set (expected to differ post-patch; their exact bytes are
-//      pinned by the optional trusted patch manifest instead).
-//   4. When `vendor/openbot/patches/patch-manifest.json` exists (F-owned),
-//      its {files: {path: sha256}} post-hashes are enforced exactly.
+//      pinned by the REQUIRED trusted patch manifest instead).
+//   4. The trusted patch manifest (F-owned,
+//      vendor/openbot/patches/manifest.json) is REQUIRED, never optional:
+//      its files[*].postSha256 post-hashes are enforced exactly, every
+//      approved seam file must be pinned by it, its per-file
+//      originalSha256 must agree with the lock wherever both record the
+//      file, its baseCommit must equal the lock revision, and its
+//      unmodified[*] digests are enforced for every seam file present
+//      (sparse verification checkouts may omit seams — apply.sh parity;
+//      a tracked deletion is already refused by rule 2). A missing,
+//      malformed or schema-foreign manifest is a FAILED refusal.
 //   5. Markers remain as defense-in-depth only, never as sole proof.
 // Returns {ok, missing, reason, report}.
 export const APPROVED_MODIFIED = new Set(['server/src/index.ts', 'server/src/config.ts']);
@@ -656,21 +705,68 @@ export function verifyDeployedCheckout(checkout, lock, { manifest = null } = {})
     checked++;
   }
   report.filesOk = checked;
-  // 4. Trusted post-hash manifest (F-owned) wins over marker heuristics.
-  const post = manifest?.files ?? null;
-  if (post) {
-    for (const [name, digest] of Object.entries(post)) {
-      let data;
-      try {
-        data = readFileSyncCache(join(checkout, name));
-      } catch {
-        return failOut(`manifest-pinned file absent in deployed checkout: ${name}`, report);
-      }
-      const got = createHash('sha256').update(data).digest('hex');
-      if (got !== digest) return failOut(`deployed file differs from trusted patch manifest: ${name}`, report);
-    }
-    report.manifestOk = Object.keys(post).length;
+  // 4. Trusted patch manifest (F-owned) is REQUIRED and enforced exactly.
+  //    No manifest, no verification: structural rules + markers alone can
+  //    never prove the deployed bytes are the approved post-patch bytes.
+  if (!manifest || typeof manifest !== 'object' || Array.isArray(manifest)) {
+    return failOut('trusted patch manifest missing (vendor/openbot/patches/manifest.json is required; post-hash verification is never optional)', report);
   }
+  const post = manifest.files;
+  if (!post || typeof post !== 'object' || Array.isArray(post) || Object.keys(post).length === 0) {
+    return failOut('trusted patch manifest has no files map (schema 1: {files: {path: {originalSha256, postSha256}}})', report);
+  }
+  if (manifest.baseCommit != null && manifest.baseCommit !== want) {
+    return failOut(`patch manifest baseCommit ${manifest.baseCommit} != locked ${want}`, report);
+  }
+  for (const seam of APPROVED_MODIFIED) {
+    if (!(seam in post)) return failOut(`approved seam file not pinned by trusted patch manifest: ${seam}`, report);
+  }
+  for (const [name, entry] of Object.entries(post)) {
+    if (!entry || typeof entry !== 'object' || Array.isArray(entry)
+      || typeof entry.postSha256 !== 'string' || !SHA256_HEX.test(entry.postSha256)) {
+      return failOut(`patch manifest entry is not the {originalSha256, postSha256} schema: ${name}`, report);
+    }
+    if (entry.originalSha256 != null) {
+      if (typeof entry.originalSha256 !== 'string' || !SHA256_HEX.test(entry.originalSha256)) {
+        return failOut(`patch manifest originalSha256 malformed: ${name}`, report);
+      }
+      const locked = lock?.files?.[name];
+      if (locked && locked !== entry.originalSha256) {
+        return failOut(`patch manifest original hash disagrees with the vendor lock: ${name}`, report);
+      }
+    }
+    let data;
+    try {
+      data = readFileSyncCache(join(checkout, name));
+    } catch {
+      return failOut(`manifest-pinned file absent in deployed checkout: ${name}`, report);
+    }
+    const got = createHash('sha256').update(data).digest('hex');
+    if (got !== entry.postSha256) return failOut(`deployed file differs from trusted patch manifest post-hash: ${name}`, report);
+  }
+  report.manifestOk = Object.keys(post).length;
+  const unmodified = manifest.unmodified ?? {};
+  if (!unmodified || typeof unmodified !== 'object' || Array.isArray(unmodified)) {
+    return failOut('trusted patch manifest unmodified map is malformed (schema 1: {path: sha256})', report);
+  }
+  let unmodifiedOk = 0;
+  for (const [name, digest] of Object.entries(unmodified)) {
+    if (typeof digest !== 'string' || !SHA256_HEX.test(digest)) {
+      return failOut(`patch manifest unmodified digest malformed: ${name}`, report);
+    }
+    let data;
+    try {
+      data = readFileSyncCache(join(checkout, name));
+    } catch {
+      // Sparse verification checkouts may omit a seam file entirely
+      // (apply.sh parity); a tracked deletion is refused by rule 2.
+      continue;
+    }
+    const got = createHash('sha256').update(data).digest('hex');
+    if (got !== digest) return failOut(`unmodified seam drift vs trusted patch manifest: ${name}`, report);
+    unmodifiedOk++;
+  }
+  report.manifestUnmodifiedOk = unmodifiedOk;
   // 5. Markers: corroboration only.
   let bridge = '';
   try {
@@ -691,11 +787,11 @@ export function verifyDeployedCheckout(checkout, lock, { manifest = null } = {})
     return failOut('assembly hook missing in index.ts (patch not applied)', report);
   }
   report.patchApplied = true;
-  return { ok: true, reason: `deployed checkout verified (HEAD ${head.slice(0, 12)}, ${checked} files, approved seam only${post ? ', manifest post-hashes match' : ''})`, report };
+  return { ok: true, reason: `deployed checkout verified (HEAD ${head.slice(0, 12)}, ${checked} files, approved seam only, manifest post-hashes match)`, report };
 }
 
 export async function checkUpstreamPlatform({ env = process.env, fetchImpl = fetch, repoRoot = null, probe = true, sdkClient = null, deployedVerifier = null } = {}) {
-  const checks = {};
+  const checks = { doctor_contract: DOCTOR_CONTRACT };
   let state = 'READY';
   const need = (reason) => { if (state === 'READY') state = 'NEEDS_INPUT'; (checks.needs ??= []).push(reason); };
   const fail = (reason) => { state = 'FAILED'; (checks.failures ??= []).push(reason); };
@@ -710,7 +806,7 @@ export async function checkUpstreamPlatform({ env = process.env, fetchImpl = fet
     checks.mode = resolved.mode;
     checks.upstream = resolved.upstream;
   } catch (error) {
-    return { protocol: 'upstream-platform-v1', state: 'FAILED', checks: { failures: [String(error.message)], mode: 'unknown' } };
+    return { protocol: 'upstream-platform-v1', doctor_contract: DOCTOR_CONTRACT, state: 'FAILED', checks: { doctor_contract: DOCTOR_CONTRACT, failures: [String(error.message)], mode: 'unknown' } };
   }
 
   // 1. Source pin verified: lock format + pinned revision + DEPLOYED checkout
@@ -730,15 +826,21 @@ export async function checkUpstreamPlatform({ env = process.env, fetchImpl = fet
       checks.sourcePin.deployed = { configured: false };
     } else if (checkout) {
       // deployedVerifier is a TEST-ONLY seam; production always runs the
-      // real verifier above. The trusted post-hash manifest is F-owned
-      // (vendor/openbot/patches/patch-manifest.json); when present its exact
-      // post-hashes are enforced, otherwise the approved-footprint rules.
-      let manifest = null;
-      try {
-        manifest = JSON.parse(readFileSyncCache(join(root, 'vendor/openbot/patches/patch-manifest.json'), 'utf8'));
-      } catch { /* F has not published a manifest yet; structural rules apply */ }
+      // real verifier above. The trusted patch manifest is F-owned
+      // (vendor/openbot/patches/manifest.json) and REQUIRED: loading is
+      // fail-closed, so a missing, unreadable or tampered manifest is a
+      // FAILED refusal here, never a silent downgrade to structural-only
+      // verification.
       const verify = deployedVerifier ?? verifyDeployedCheckout;
-      const dep = deployedVerifier ? verify(checkout, lock) : verify(checkout, lock, { manifest });
+      let dep;
+      if (deployedVerifier) {
+        dep = verify(checkout, lock);
+      } else {
+        const loaded = loadPatchManifest(root);
+        dep = loaded.ok
+          ? verify(checkout, lock, { manifest: loaded.manifest })
+          : { ok: false, missing: false, reason: loaded.reason, report: { configured: true, manifestOk: false } };
+      }
       checks.sourcePin.deployed = dep.report;
       if (!dep.ok) {
         if (dep.missing) need(`deployed checkout not provisioned: ${dep.reason}`);
@@ -837,5 +939,5 @@ export async function checkUpstreamPlatform({ env = process.env, fetchImpl = fet
     (checks.needs ??= []).push('probe disabled: live verification not performed (re-run with probing to complete setup)');
   }
 
-  return { protocol: 'upstream-platform-v1', state, checks };
+  return { protocol: 'upstream-platform-v1', doctor_contract: DOCTOR_CONTRACT, state, checks };
 }
