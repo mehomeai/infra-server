@@ -7,9 +7,9 @@ Learn about the vision at [Me — Your intelligence. Yours.](https://mehomeai.re
 
 ## Status
 
-Implemented on review branch `feat/home-agent-foundation`
-(committed/pushed; draft PR #1 pending review/checks). No merge to
-protected `main`; no deployed release. Home service
+Implemented on `main`: the home-agent foundation merged via PR #1,
+and the upstream agent infrastructure (pinned OpenBot reuse) merged
+2026-11-03 via PR #3. No deployed release. Home service
 (single-host SQLite + task workers): pairing, sessions, conversations,
 tasks, durable questions/approvals, parallel children (R8 `task-rpc-v1`),
 notifications outbox (opt-in, generic payloads only), coordinator heartbeat
