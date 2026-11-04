@@ -26,7 +26,11 @@ jobs:
       - name: Check repository hygiene
         run: python3 scripts/check_repository.py
       - name: Check whitespace
-        run: git show --format= --check HEAD
+        # vendor/ holds byte-verified upstream patch payloads whose content
+        # (including trailing whitespace in patched source lines) is pinned
+        # by hash in vendor/openbot/patches/manifest.json — it must not be
+        # reformatted, so the whitespace gate covers everything else.
+        run: git show --format= --check HEAD -- . ':(exclude)vendor'
 
   reuse-integration:
     name: Reused worker and upstream tooling
