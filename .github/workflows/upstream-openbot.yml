@@ -123,7 +123,7 @@ jobs:
         with:
           ref: ${{ needs.candidate.outputs.base_revision }}
           persist-credentials: false
-      - uses: actions/download-artifact@634f93cb2916e3fdff678855b9b062d0335ce0 # v5
+      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
         with:
           name: openbot-candidate
           path: ${{ runner.temp }}/openbot-candidate
