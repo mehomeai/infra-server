@@ -206,6 +206,16 @@ services:
     profiles: ["harness"]
     image: ${HARNESS_IMAGE:-openbot-agent-langgraph-agui:6bfee780c8e8}
     pull_policy: never
+    # Readiness handshake (OPEN #4): the harness must be able to reach
+    # Ollama on the host from INSIDE its own container namespace — parity
+    # with the server service above. The home tracker's full tier asks the
+    # harness itself for its served-model view (GET /models on 4206,
+    # ME_HARNESS_MODEL_URL when overridden) and only accepts readiness
+    # when the selected BOT_MODEL tag is served from this namespace
+    # (evidence model.namespace='harness'); a host-side /api/tags read
+    # alone never proves readiness.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     ports:
       # Loopback only; the server reaches it as http://agent-harness:4206/.
       - "127.0.0.1:${HARNESS_PORT:-4206}:4206"

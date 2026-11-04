@@ -41,6 +41,28 @@ Minimal readiness surface only; no user/device/data details.
 { "ready": true, "installation_id": "<uuid>" }
 ```
 
+Storage-only by design (setup lifecycle waits depend on this meaning); it
+says nothing about upstream/platform readiness — see `/readyz/full`.
+
+### `GET /readyz/full` → 200 | 503
+
+Full-platform readiness from the two-tier handshake evidence (light 120 s
++ full 600 s; see `upstream-platform-v1.md` § Readiness handshake).
+Synchronous in-memory read; never awaits the network.
+
+```json
+{ "ready": true, "at": 1730000000000,
+  "checks": { "nativeAuth": { "probed": true, "authenticated": true },
+              "fleet": { "computers": 2, "isolation": "per-person", "personKeys": 2 },
+              "model": { "selectedServed": true, "namespace": "harness" },
+              "intelligence": { "probed": false, "source": "doctor" } } }
+```
+
+503 carries `{ "ready": false, "at": ..., "reason": "<failing reason>",
+"checks": ... }` with the last full probe's checks for diagnosis. In FULL
+mode `/healthz` additionally carries an additive `evidence` field:
+`{ "tier": "full|light", "at": ..., "namespace": "harness|supervisor|host|null" }`.
+
 ## Pairing (narrow, single-use)
 
 Invitation is created **locally on the home host** (filesystem access is the

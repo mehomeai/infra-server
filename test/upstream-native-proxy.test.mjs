@@ -76,8 +76,10 @@ function createFakeUpstream() {
       const asserted = testVerifyAssertion(headers['x-me-home-assertion']);
       seen.push({ method, path, assertionPresent: Boolean(headers['x-me-home-assertion']), assertionRole: asserted?.role ?? null, assertionUser: asserted?.userId ?? null });
       // Anonymous surface (mirrors upstream app.ts: /health + /api/capabilities
-      // answer without a session). Everything else requires the assertion.
-      const anonymous = method === 'GET' && (path === '/health' || path === '/api/capabilities');
+      // answer without a session). /v1/models stands in for the remote
+      // provider list the full-tier model probe reads (key-auth'd there,
+      // not assertion-auth'd). Everything else requires the assertion.
+      const anonymous = method === 'GET' && (path === '/health' || path === '/api/capabilities' || path === '/v1/models');
       let me = null;
       if (!anonymous) {
         const gate = principalOf(headers);
@@ -87,6 +89,18 @@ function createFakeUpstream() {
       const body = init.body ? JSON.parse(init.body.toString()) : undefined;
       if (method === 'GET' && path === '/api/agents') {
         return fakeRes(200, { agents: [{ id: 'bot_help', name: 'Helper', mine: true, canManage: true }] }, { 'set-cookie': 'upstream-session=abc; Path=/; HttpOnly' });
+      }
+      if (method === 'GET' && path === '/v1/models') {
+        return fakeRes(200, { data: [{ id: 'gpt-5.5' }] });
+      }
+      if (method === 'GET' && path === '/api/computers/fleet') {
+        // Full-tier fleet probe surface: admin sees the per-person fleet,
+        // a user assertion is denied (role gate enforced).
+        if (me.role !== 'admin') return fakeRes(403, { error: 'forbidden' });
+        return fakeRes(200, {
+          isolation: 'per-person',
+          computers: [{ id: 'pc_alice', kind: 'person', personId: 'alice' }],
+        });
       }
       if (method === 'GET' && (path === '/health' || path === '/api/health')) {
         return fakeRes(200, { status: 'ok' });
@@ -163,6 +177,11 @@ const FULL_ENV = {
   COMPUTER_SUPERVISOR_URL: 'http://127.0.0.1:4500',
   SUPERVISOR_TOKEN: 's',
   COMPUTER_TOKEN: 'c',
+  // Native model selection for the full-tier model probe: remote OpenAI
+  // route against the fake's /v1/models surface (no local Ollama route).
+  BOT_MODEL: 'gpt-5.5',
+  OPENAI_BASE_URL: 'http://127.0.0.1:9/v1',
+  OPENAI_API_KEY: 'test-openai-key',
 };
 
 async function launch(t, { env = FULL_ENV, fake = 'healthy', liveIntervalMs = 120_000, liveTtlMs = null, liveKick = true } = {}) {

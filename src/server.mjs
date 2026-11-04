@@ -270,7 +270,7 @@ function storeMessage(db, conv, session, body) {
   return { ok: true, status: 201, record: { ...row, duplicate: false } };
 }
 
-export function createHomeServer({ dbPath, broker: brokerOverrides = {}, rateLimit: rateLimitOverrides, env = process.env, notifications: notificationOverrides = {}, coordinator: coordinatorOverrides = {}, upstreamFetch = fetch, liveIntervalMs = 120_000, liveTtlMs = null, liveKick = true } = {}) {
+export function createHomeServer({ dbPath, broker: brokerOverrides = {}, rateLimit: rateLimitOverrides, env = process.env, notifications: notificationOverrides = {}, coordinator: coordinatorOverrides = {}, upstreamFetch = fetch, liveIntervalMs = 120_000, liveTtlMs = null, liveFullIntervalMs = null, liveKick = true } = {}) {
   const { db, installationId } = openHomeDb(dbPath);
   // H8 coordinator (disabled by default): consumes the S7-written private
   // credentials file and heartbeats the hosted backend. No outbound network
@@ -344,6 +344,7 @@ export function createHomeServer({ dbPath, broker: brokerOverrides = {}, rateLim
     fetchImpl: upstreamFetch,
     intervalMs: liveIntervalMs,
     ...(liveTtlMs == null ? {} : { ttlMs: liveTtlMs }),
+    ...(liveFullIntervalMs == null ? {} : { fullIntervalMs: liveFullIntervalMs }),
     cachePath: env.ME_DOCTOR_CACHE ?? doctorCachePath(dbPath),
   });
   let http = null;
@@ -396,6 +397,25 @@ export function createHomeServer({ dbPath, broker: brokerOverrides = {}, rateLim
         send(res, 200, { ready: true, installation_id: installationId });
       } catch {
         fail(res, 503, 'not_ready', 'Storage unavailable');
+      }
+      return;
+    }
+    // Full-platform readiness (OPEN #4): synchronous in-memory read of the
+    // two-tier handshake evidence — 200 only when the FULL tier (fleet /
+    // role gate / model-served incl. container-namespace proof) holds
+    // fresh passing evidence. /readyz above stays storage-only on purpose
+    // (setup-infra lifecycle waits depend on that meaning).
+    if (method === 'GET' && pathname === '/readyz/full') {
+      let fullView;
+      try {
+        fullView = liveTracker.getFull();
+      } catch {
+        fullView = { ready: false, reason: 'missing', at: Date.now(), checks: null };
+      }
+      if (fullView.ready) {
+        send(res, 200, { ready: true, at: fullView.at, checks: fullView.checks });
+      } else {
+        send(res, 503, { ready: false, at: fullView.at, reason: fullView.reason ?? 'not-ready', checks: fullView.checks });
       }
       return;
     }

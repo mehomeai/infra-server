@@ -283,6 +283,16 @@ export function capabilityReport(env = process.env, live = { live: false }) {
     needsSetup: !liveOk,
     ...((missing.length > 0 || liveMissing.length > 0) ? { missing: [...missing, ...liveMissing] } : {}),
     liveEvidence: live?.live === true ? { fresh: true } : { fresh: false, reason: live?.reason ?? 'missing' },
+    // Two-tier handshake evidence (additive, OPEN #4): which tier proved
+    // readiness, when, and which namespace proved the model. Absence =
+    // legacy tracker. No env values, no secrets.
+    ...(live?.evidence ? {
+      evidence: {
+        tier: live.evidence.tier ?? null,
+        at: live.evidence.at ?? null,
+        namespace: live.evidence.namespace ?? null,
+      },
+    } : {}),
     // Phone primary is native REST on this same authority (proxied after
     // ht1 validation + server-side assertion). /api/copilotkit stays mounted
     // for the upstream-internal native pipeline; it is not the phone path.
