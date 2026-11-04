@@ -26,7 +26,7 @@ actual upstream `agent-computer`/`supervisor` Dockerfiles/services
 engine, no in-repo huge assets. Verified by
 `python3 scripts/upstream-openbot.py verify [--fetch|--deployed DIR]`. One
 reviewed patch is applied at deploy time, never vendored:
-`vendor/openbot/patches/0001-home-identity-bridge.patch` rev 2 (Me ht1→BetterAuth
+`vendor/openbot/patches/0001-home-identity-bridge.patch` rev 3 (Me ht1→BetterAuth
 single-use assertion seam, bridge-only mode; deterministic `apply.sh`; ledger
 in `patches/README.md`; exercised against the real patched module in
 `test/upstream-patch-live.test.mjs`).
