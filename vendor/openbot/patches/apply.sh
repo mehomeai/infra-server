@@ -6,7 +6,12 @@
 set -eu
 PIN="6bfee780c8e8d05141375ea55ebde33eefb3dbc0"
 DIR="${OPENBOT_CHECKOUT:-/opt/openbot}"
-HERE="$(dirname "$0")"
+# Canonicalize HERE to an ABSOLUTE path: the documented invocation
+# `sh vendor/openbot/patches/apply.sh` makes $0 (and therefore HERE)
+# relative, and `git -C "$DIR" apply "$HERE"/0001-*.patch` resolves the
+# patch path INSIDE the checkout, where it does not exist. Every other
+# use of HERE/manifest also assumes a stable path, so resolve it once.
+HERE="$(CDPATH= cd -- "$(dirname "$0")" && pwd)"
 MANIFEST="$HERE/manifest.json"
 
 if [ ! -d "$DIR/.git" ]; then

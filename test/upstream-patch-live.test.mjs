@@ -313,8 +313,16 @@ test('real patched module: bridge-only AuthService needs no OAuth app', async (t
 
 test('actual readConfig boots bridge-only; missing/short keys fail closed; dev flags refused', async (t) => {
   // Try the REAL native config source first (full checkout with deps).
-  // Local Mac without Bun/heavy deps falls back to the extracted-seam proof
-  // below; Linux CI with OPENBOT_CHECKOUT exercises the real loadConfig.
+  // The pinned loaders are Bun-runtime-only: upstream TS uses extensionless
+  // relative imports that Node --experimental-transform-types cannot
+  // resolve (ERR_MODULE_NOT_FOUND), so under Node this import can only
+  // succeed by accident. When OPENBOT_CHECKOUT is set, a failed real
+  // import FAILS this test with the real error — never a silent fall
+  // through to the seam proof. The permanent real-loader proof runs under
+  // Bun: scripts/openbot-bun-proof.ts (`npm run test:upstream-bun`),
+  // wired into .github/workflows/upstream-openbot.yml. Without a checkout
+  // only the extracted-seam proof below runs, and the log at the end of
+  // this test says exactly that.
   const checkout = process.env.OPENBOT_CHECKOUT;
   let usedReal = false;
   if (checkout) {
@@ -330,9 +338,13 @@ test('actual readConfig boots bridge-only; missing/short keys fail closed; dev f
       };
       const cfg = mod.loadConfig(baseEnv);
       assert.equal(cfg.singleUser, false, 'bridge-only boots with singleUser false');
+      assert.equal(cfg.port, 3001, 'bridge-only boots on the pinned default port 3001');
       usedReal = true;
     } catch (e) {
-      // Fall through to seam proof; do not claim real proof on failure.
+      // OPENBOT_CHECKOUT was explicitly provided: the real import MUST
+      // work. Fail loudly with the real error instead of silently
+      // degrading to the seam proof and implying real coverage.
+      assert.fail(`OPENBOT_CHECKOUT is set (${checkout}) but importing the real pinned loadConfig failed: ${e?.message ?? e}`);
     }
   }
   // Seam proof from the ACTUAL patch bytes (not a handwritten stub):
@@ -387,7 +399,7 @@ test('actual readConfig boots bridge-only; missing/short keys fail closed; dev f
   assert.ok(patchText.includes('OPENBOT_SINGLE_USER/OPENBOT_DEV_NO_AUTH must not be set'), 'dev flags refused in bridge mode');
   assert.ok(patchText.includes('if (meHomeBridgeConfigured(environment)) {\n+      return undefined;'), 'authConfig recognises the bridge authority');
   if (!usedReal) {
-    console.log('# full readConfig via real checkout skipped locally (no OPENBOT_CHECKOUT); seam proof above + Linux CI with checkout covers actual loadConfig');
+    console.log('# real loadConfig NOT exercised in this run: OPENBOT_CHECKOUT is unset, so only the extracted-seam proof above ran. The pinned loadConfig/loadTenantPackage are Bun-runtime-only (extensionless TS imports Node cannot resolve); the real-loader proof is scripts/openbot-bun-proof.ts (`npm run test:upstream-bun`), run in CI by .github/workflows/upstream-openbot.yml.');
   }
 });
 

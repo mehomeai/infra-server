@@ -79,6 +79,28 @@ jobs:
         run: |
           npm run test:home
           npm run test:upstream
+      # OPEN #2: the pinned loadConfig/loadTenantPackage are Bun-runtime-only
+      # (extensionless TS imports Node cannot resolve), so the Node suites
+      # above can only prove the patch seam. This step executes the REAL
+      # loaders under Bun against the pinned (current, not candidate)
+      # checkout. Locally `npm run test:upstream-bun` skips gracefully when
+      # OPENBOT_CHECKOUT is unset; here the checkout is fetched, so it runs.
+      - uses: oven-sh/setup-bun@735343b667d3e6f658f44d0eca948eb6282f2b76 # v2.0.2
+        if: steps.check.outputs.changed == 'true'
+        with:
+          bun-version: 1.4.3
+      - name: Fetch the pinned OpenBot checkout for the Bun loader proof
+        if: steps.check.outputs.changed == 'true'
+        run: OPENBOT_DIR="$RUNNER_TEMP/openbot-pin" sh scripts/openbot-checkout.sh --full
+      - name: Install pinned checkout dependencies (proof only)
+        if: steps.check.outputs.changed == 'true'
+        working-directory: ${{ runner.temp }}/openbot-pin
+        run: bun install --ignore-scripts
+      - name: Prove pinned loadConfig/loadTenantPackage under Bun (OPEN #2)
+        if: steps.check.outputs.changed == 'true'
+        env:
+          OPENBOT_CHECKOUT: ${{ runner.temp }}/openbot-pin
+        run: npm run test:upstream-bun
       - name: Save only candidate source data
         if: steps.check.outputs.changed == 'true'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4

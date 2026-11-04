@@ -98,6 +98,20 @@ are schema-tested (`test/upstream-tenant.test.mjs`, no Bun/Docker needed).
 `DEPLOYMENT_ID` is generated once and persisted by the installer (unique home
 installation namespace).
 
+Runtime requirement (OPEN #2, proven): the pinned upstream loaders
+`server/src/config.ts` (`loadConfig`) and `server/src/tenant-package.ts`
+(`loadTenantPackage`) are **Bun-runtime-only**. Upstream TypeScript uses
+extensionless relative imports, which Node (including
+`--experimental-transform-types`) cannot resolve — importing them under
+Node fails with `ERR_MODULE_NOT_FOUND`. This is an upstream construction
+property, not a defect: the pinned server runs under Bun (upstream pins
+`bun@1.4.3`). Node test suites therefore prove the patch seam from the
+extracted patch bytes only; the permanent proof that the REAL loaders
+execute is `scripts/openbot-bun-proof.ts` (`npm run test:upstream-bun`,
+requires `OPENBOT_CHECKOUT` pointing at a patched checkout with
+`bun install --ignore-scripts` run inside it; skips explicitly when unset),
+wired into `.github/workflows/upstream-openbot.yml`.
+
 Doctor: `node --experimental-transform-types src/cli.mjs upstream-doctor`
 (`upstream-platform-v1`; `--no-probe` never yields READY). FULL READY only
 when pin + deployed checkout (git HEAD == lock, unexpected tracked drift
