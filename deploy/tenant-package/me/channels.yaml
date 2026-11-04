@@ -1,0 +1,7 @@
+# Me home channels: the owner's personal conversation with their agent.
+channels:
+  - id: me
+    name: Me
+    description: Personal conversation with Me.
+    permitted_agents: [me]
+    allowed_groups: [all]

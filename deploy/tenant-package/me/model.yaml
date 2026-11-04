@@ -1,0 +1,10 @@
+# Me home model: the SAME native selection the harness runs (single source:
+# BOT_PROVIDER/BOT_MODEL in the operator env file, consumed by both the
+# harness container and this tenant record). The upstream tenant schema only
+# admits openai|anthropic; a google selection refuses boot here (fail closed)
+# until the package is extended, while the OpenAI-compatible local route
+# (BOT_PROVIDER=openai + OPENAI_BASE_URL) works today.
+model:
+  provider: ${BOT_PROVIDER:-openai}
+  credential_secret_ref: ${MODEL_CREDENTIAL_REF:-openai-api-key}
+  default_model: ${BOT_MODEL:-gpt-5.5}

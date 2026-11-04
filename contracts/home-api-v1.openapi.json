@@ -142,6 +142,15 @@
         }
       }
     },
+    "/readyz/full": {
+      "get": {
+        "summary": "Full-platform readiness (anonymous, two-tier handshake evidence)",
+        "responses": {
+          "200": { "description": "Full tier (fleet, role gate, model-served incl. container-namespace proof) holds fresh passing evidence." },
+          "503": { "description": "Platform not ready; body carries the failing reason and last full checks." }
+        }
+      }
+    },
     "/v1/pair": {
       "post": {
         "summary": "Redeem pairing invitation",

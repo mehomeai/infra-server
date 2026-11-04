@@ -1,0 +1,432 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Me home infrastructure <home@me.local>
+Date: Tue, 3 Nov 2026 00:00:00 +0000
+Subject: [PATCH 1/1] Me home identity bridge: server-side ht1 assertion sessions (rev3)
+
+Base: CopilotKit/OpenBot @ 6bfee780c8e8d05141375ea55ebde33eefb3dbc0 (main).
+server/src/index.ts sha256 at base:
+6d0fa8dc72ae62d7b41f1a35083b1e8e82f53c2fda27255457416075b5d10ddd
+server/src/config.ts sha256 at base:
+d210a4d4b3c43b869aa38483e5815ac0c3b3f77a6df2d66b5325d7510e3cf3c3
+server/src/request-actor.ts sha256 at base (unmodified):
+95099b80ec151b1a6cb0989b52e4f6503012237b834c7def1170f5346830ab77
+server/src/auth/guards.ts sha256 at base (unmodified):
+20071b33c99d937d551befb37532cc724e1ef29a7d3c2a707c7f4c3fed8f
+
+Me (self-hosted home computer) authenticates paired phones with opaque
+ht1_* session tokens and maps each owner 1:1 to an upstream BetterAuth
+user server-side. The private upstream listener is unreachable from
+phones directly; the home server forwards native REST calls with a
+short-lived, single-use HMAC assertion (x-me-home-assertion, key
+ME_HOME_BRIDGE_SECRET, held server-side on both hosts, never sent to
+phones).
+
+This patch consumes the assertion at the single AuthService seam:
+  - wrapAuthWithHomeBridge(auth) checks the assertion header first and
+    returns a { user: { id, email, name, role } } session for it;
+  - no assertion header -> pure delegation to BetterAuth/Entra/
+    organization sessions (zero behaviour change);
+  - no wrapped service (bridge-only: no separate Google/Entra/Okta app)
+    -> minimal AuthService declining interactive sign-in, bridge-only
+    sessions; with no bridge key the bridge path always refuses;
+  - present-but-invalid assertion -> null (refuse; never fall through).
+  - role travels inside the signed assertion per request (no cache), so
+    operator role changes apply on the next call; no BetterAuth rows are
+    created (virtual trusted principal); unique stable home-mapped ids.
+  - nonce + 60s TTL: each assertion is accepted exactly once (replay
+    refused via a bounded in-memory seen-cache).
+
+Same-request re-reads (P0-2 fix, rev3): native request-actor
+identifyUser AND identifyActor and guards may read the SAME HTTP request
+multiple times. The wrapper memoizes the verified identity PER ACTUAL
+REQUEST HEADERS OBJECT (WeakMap) bound to the assertion value, so
+re-reading auth within the same Request succeeds without re-consuming
+the nonce. A NEW Request / new Headers object reusing an assertion
+replays and is refused. Mutated headers invalidate the cache and refuse
+(never fall through to cookies). Raw verifyHomeAssertion still denies
+replay on every call; the one-time nonce guard is not disabled globally
+and no shared admin is accepted.
+
+Bridge-only boot (P0-1 fix, rev3): readConfig.singleUser previously
+threw without Google/Microsoft/Okta even with a valid bridge key, before
+the index wrap ran. config.ts now recognises a valid dedicated
+ME_HOME_BRIDGE_SECRET (>=32 chars) as an auth authority: with a valid
+key and no external OAuth, full loadConfig returns singleUser false so
+the bridge-only AuthService works. Missing/short keys still fail closed;
+bridge + OPENBOT_SINGLE_USER/OPENBOT_DEV_NO_AUTH refuses (no shared
+dev admin); ordinary OAuth/org behaviour is unchanged.
+
+createRequestActor's getSession reads auth.api.getSession, so the
+Copilot runtime identifyUser/identifyActor seam and the http-server
+websocket guard see the same principal with no second change.
+
+Security properties (reviewed, deterministic):
+  - HMAC-SHA256 with timingSafeEqual; 60s TTL; single-use nonces;
+    role allowlist admin|user; key >=32 chars or the bridge stays inert.
+  - No cookie forge: the bridge never reads/writes BetterAuth cookies.
+  - No shared admin: no static user, no OPENBOT_SINGLE_USER change, no
+    first-visitor promotion; role comes from the home allowlist only.
+  - No phone user_id trust: the id is the home-mapped upstream id inside
+    the signed assertion, never a request body field.
+  - Private listener only: refuses unless the assertion key is configured,
+    and the home proxy only forwards to loopback/compose addresses.
+---
+ server/src/config.ts      |  40 +++++++++++++++++++++++++++++
+ server/src/home-bridge.ts | 239 +++++++++++++++++++++++++++++++++++++
+ server/src/index.ts       |  11 +++++++++-
+ 3 files changed, 289 insertions(+), 1 deletion(-)
+
+diff --git a/server/src/config.ts b/server/src/config.ts
+index 50f70a0..121ef1d 100644
+--- a/server/src/config.ts
++++ b/server/src/config.ts
+@@ -166,6 +166,25 @@ export function configuredAuthProviders(
+   return providers;
+ }
+ 
++/**
++ * Me home bridge authority (patched seam, reviewed).
++ *
++ * A valid dedicated ME_HOME_BRIDGE_SECRET (>=32 chars, server-side only)
++ * counts as a configured auth authority, like a Google/Microsoft/Okta
++ * provider. Bridge-only deployments (paired phones, no separate OAuth app)
++ * therefore boot with `singleUser` false and the wrapped bridge-only
++ * AuthService. Short/missing keys leave the bridge inert: existing
++ * fail-closed behaviour (singleUser throw without OAuth) is unchanged.
++ * Ordinary OAuth/organization behaviour is untouched when the bridge key
++ * is absent.
++ */
++export function meHomeBridgeConfigured(
++  environment: Record<string, string | undefined>,
++): boolean {
++  const raw = environment.ME_HOME_BRIDGE_SECRET?.trim() ?? "";
++  return raw.length >= 32;
++}
++
+ export type ManagedAgentConfig = {
+   /** The bundled Bot, absent when this deployment's provider cannot run it. */
+   endpoint?: URL;
+@@ -840,6 +859,9 @@ function authConfig(
+   const baseUrl = url(environment, "BETTER_AUTH_URL");
+ 
+   if (!google && !microsoft && !okta) {
++    if (meHomeBridgeConfigured(environment)) {
++      return undefined;
++    }
+     if (secret || baseUrl) {
+       throw new Error(
+         "BETTER_AUTH_SECRET or BETTER_AUTH_URL is set but no identity provider is. Configure GOOGLE_OAUTH_*, MICROSOFT_OAUTH_* or OKTA_OAUTH_*, or unset both",
+@@ -1466,6 +1488,15 @@ export function loadConfig(
+     publicUrl,
+     keyEncryptionKey: deploymentKey,
+   });
++  if (
++    meHomeBridgeConfigured(environment) &&
++    (environment.OPENBOT_SINGLE_USER?.trim() === "true" ||
++      environment.OPENBOT_DEV_NO_AUTH?.trim() === "true")
++  ) {
++    throw new Error(
++      "ME_HOME_BRIDGE_SECRET is configured, so OPENBOT_SINGLE_USER/OPENBOT_DEV_NO_AUTH must not be set: bridge mode has its own per-request identity and no shared admin.",
++    );
++  }
+ 
+   return {
+     port: serverPort(environment),
+@@ -1509,9 +1540,19 @@ export function loadConfig(
+      * deployment naming an external authority lets it win, and `singleUserAllowed` is never
+      * reached and so cannot refuse a combination that already resolves.
+      */
++    /*
++     * Me home bridge counts as an auth authority (see
++     * meHomeBridgeConfigured): bridge-only boots with singleUser false and
++     * the wrapped bridge-only AuthService. Dev no-auth flags are refused
++     * above in bridge mode.
++     */
+     singleUser:
+       !organizationAuthUrl &&
+-      singleUserAllowed(environment, configuredAuthProviders(auth).length > 0),
++      singleUserAllowed(
++        environment,
++        configuredAuthProviders(auth).length > 0 ||
++          meHomeBridgeConfigured(environment),
++      ),
+     accessibility: accessibilityEnabled(environment),
+     generativeUi: generativeUiEnabled(environment),
+     selfHostBanner: selfHostBannerEnabled(environment),
+diff --git a/server/src/home-bridge.ts b/server/src/home-bridge.ts
+new file mode 100644
+index 0000000..c4c1540
+--- /dev/null
++++ b/server/src/home-bridge.ts
+@@ -0,0 +1,239 @@
++/**
++ * Me home identity bridge (patched seam, reviewed).
++ *
++ * The Me home server authenticates paired phones with opaque ht1_* tokens
++ * and maps each owner 1:1 to an upstream user server-side. It forwards
++ * native REST calls to this private listener with a short-lived,
++ * single-use HMAC assertion in `x-me-home-assertion`, keyed by
++ * ME_HOME_BRIDGE_SECRET (server-side only, never sent to phones, never a
++ * BetterAuth cookie, never a shared admin credential).
++ *
++ * Assertion wire format (v2):
++ *   `v2.{userId}.{expMs}.{role}.{nonceHex}.{mac}`
++ * where mac is the hex HMAC-SHA256 of the dot-joined first five fields
++ * under the bridge key. userId matches upstream person/bot id rules
++ * ([A-Za-z0-9][A-Za-z0-9_-]*, <=64); role is `admin` or `user`; expMs is a
++ * 60s-bounded unix-millis expiry; nonceHex is 128-bit random per request
++ * and is accepted exactly once (replay refused via a bounded in-memory
++ * seen-cache swept on expiry).
++ *
++ * Same-request re-reads: native `request-actor` (`identifyUser` +
++ * `identifyActor`) and `guards` may read the SAME HTTP request multiple
++ * times. The wrapper memoizes the verified identity PER ACTUAL REQUEST
++ * HEADERS OBJECT (WeakMap) bound to the assertion value, so re-reading
++ * auth within the same Request succeeds without re-consuming the
++ * single-use nonce. A NEW Request / new Headers object reusing an
++ * assertion replays the nonce and is refused. Mutated headers invalidate
++ * the cache and refuse (never fall through to cookies).
++ *
++ * No BetterAuth rows are created on this path: verification returns an
++ * ephemeral session object (a virtual trusted principal, like an
++ * Entra-verified actor), so the home-mapped user needs no password, no
++ * OAuth account and no sign-in row. Roles travel inside the signed
++ * assertion per request, so an operator role change applies on the next
++ * call with no restart and no cache to invalidate: guards.ts honours
++ * session.user.role without a DB role lookup, and no promotion hooks run.
++ *
++ * Active only when the key is configured (>=32 chars). Without it every
++ * function below is pure delegation / null, so an unconfigured deployment
++ * behaves exactly as upstream.
++ */
++import { createHmac, timingSafeEqual } from "node:crypto";
++import type { AuthService } from "./auth/guards";
++
++export const HOME_ASSERTION_HEADER = "x-me-home-assertion";
++export const HOME_ASSERTION_TTL_MS = 60_000;
++const HOME_ASSERTION_VERSION = "v2";
++const HOME_ID_RE = /^[A-Za-z0-9][A-Za-z0-9_-]*$/;
++const HOME_MAX_ID = 64;
++const HOME_NONCE_HEX_LEN = 32;
++const HOME_MAX_SEEN = 10_000;
++
++export type HomeBridgeSession = {
++  user: {
++    id: string;
++    email: string;
++    name: string;
++    role: "admin" | "user";
++  };
++};
++
++/** NonceHex -> expiryMs. Each nonce is accepted exactly once per TTL window. */
++const seenNonces = new Map<string, number>();
++
++function sweepSeenNonces(now: number): void {
++  if (seenNonces.size === 0) return;
++  for (const [nonce, exp] of seenNonces) {
++    if (exp <= now) seenNonces.delete(nonce);
++  }
++  while (seenNonces.size > HOME_MAX_SEEN) {
++    const oldest = seenNonces.keys().next();
++    if (oldest.done) break;
++    seenNonces.delete(oldest.value);
++  }
++}
++
++function bridgeKey(getKey: () => string | undefined): Buffer | null {
++  const raw = getKey()?.trim() ?? "";
++  // Fail closed: short/empty keys leave the bridge inert rather than weak.
++  if (raw.length < 32) return null;
++  return Buffer.from(raw, "utf8");
++}
++
++/**
++ * Verify an assertion value. Returns the mapped principal or null.
++ * Null covers every refusal: absent, malformed, expired, wrong role
++ * charset, bad MAC, replayed nonce, or bridge unconfigured. No throws for
++ * untrusted input.
++ *
++ * Single-use is enforced here on every call: the same assertion value
++ * verified twice (two different Headers objects) refuses the second time.
++ * Same-request re-reads must go through the wrapper cache below, never by
++ * calling this twice with the same value.
++ */
++export function verifyHomeAssertion(
++  value: string | null | undefined,
++  getKey: () => string | undefined,
++  now = Date.now(),
++): HomeBridgeSession | null {
++  try {
++    if (typeof value !== "string") return null;
++    const parts = value.split(".");
++    if (parts.length !== 6) return null;
++    const [version, userId, expRaw, role, nonceHex, mac] = parts;
++    if (version !== HOME_ASSERTION_VERSION) return null;
++    if (
++      !userId ||
++      userId.length > HOME_MAX_ID ||
++      !HOME_ID_RE.test(userId)
++    )
++      return null;
++    if (role !== "admin" && role !== "user") return null;
++    if (!/^[0-9a-f]{32}$/.test(nonceHex ?? "")) return null;
++    const exp = Number(expRaw);
++    if (!Number.isFinite(exp) || exp <= now) return null;
++    const key = bridgeKey(getKey);
++    if (!key) return null;
++    const payload = `${version}.${userId}.${expRaw}.${role}.${nonceHex}`;
++    const expected = createHmac("sha256", key).update(payload).digest();
++    let actual: Buffer;
++    try {
++      actual = Buffer.from(mac, "hex");
++    } catch {
++      return null;
++    }
++    if (actual.length !== expected.length) return null;
++    if (!timingSafeEqual(actual, expected)) return null;
++    sweepSeenNonces(now);
++    if (seenNonces.has(nonceHex)) return null;
++    seenNonces.set(nonceHex, exp);
++    // Display/audit identity only. Authorization uses id + signed role:
++    // guards.ts takes session.user.role verbatim, so no DB role lookup
++    // (and no promotion hook) runs on this path. No user/session rows are
++    // created: the principal is virtual and ephemeral per request.
++    return {
++      user: {
++        id: userId,
++        email: `${userId}@me.home`,
++        name: userId,
++        role,
++      },
++    };
++  } catch {
++    return null;
++  }
++}
++
++/** Interactive auth surface when no OAuth provider is configured. */
++function bridgeOnlyHandler(): Response {
++  return new Response(
++    JSON.stringify({
++      error:
++        "Interactive sign-in is not configured on this deployment. Use the paired home app.",
++    }),
++    {
++      status: 404,
++      headers: {
++        "content-type": "application/json",
++        "cache-control": "no-store",
++      },
++    },
++  );
++}
++
++type CachedBridge = { assertion: string; session: HomeBridgeSession | null };
++
++/**
++ * Per-request memo: Headers object -> { assertion, session }.
++ * Bound to the exact assertion value; any header mutation invalidates.
++ * WeakMap so entries die with the request; no cross-request replay window.
++ */
++const bridgeSessionCache = new WeakMap<Headers, CachedBridge>();
++
++function verifyAndCache(
++  header: string,
++  headers: Headers,
++  getKey: () => string | undefined,
++): HomeBridgeSession | null {
++  const cached = bridgeSessionCache.get(headers);
++  if (cached && cached.assertion === header) return cached.session;
++  if (cached) bridgeSessionCache.delete(headers);
++  const verified = verifyHomeAssertion(header, getKey);
++  bridgeSessionCache.set(headers, { assertion: header, session: verified });
++  return verified;
++}
++
++/**
++ * Wrap an AuthService so the home assertion is honoured on every guard.
++ * No assertion header -> delegate to the wrapped service unchanged, unless
++ * this same Headers object previously carried a bridge assertion and was
++ * mutated to strip it (then refuse, never fall back to cookies).
++ * Invalid assertion -> null (refuse; never fall through to cookies).
++ * Same Headers object + same assertion -> cached session (no nonce
++ * re-consumption, so identifyUser + identifyActor + guards on one Request
++ * all see the same verified owner). Different Headers object reusing an
++ * assertion -> replay refused via the single-use nonce cache.
++ * No wrapped service (bridge-only deployment: paired phones without a
++ * separate Google/Entra/Okta app) -> a minimal AuthService whose handler
++ * declines interactive sign-in and whose getSession honours only the
++ * bridge. With no bridge key configured the bridge path always refuses.
++ */
++export function wrapAuthWithHomeBridge(
++  auth: AuthService | undefined,
++  options: { getKey: () => string | undefined },
++): AuthService {
++  const bridgeOnly: AuthService["api"]["getSession"] = async (input) => {
++    const header = input.headers.get(HOME_ASSERTION_HEADER);
++    if (header === null) {
++      // Mutated strip on the same Headers object: refuse, never branch.
++      if (bridgeSessionCache.get(input.headers)) return null;
++      return null;
++    }
++    // Present means home spoke: verify strictly, refuse on failure.
++    return verifyAndCache(header, input.headers, options.getKey);
++  };
++  if (!auth) {
++    return {
++      handler: () => bridgeOnlyHandler(),
++      api: { getSession: bridgeOnly },
++    };
++  }
++  const inner = auth.api.getSession.bind(auth.api);
++  return {
++    ...auth,
++    api: {
++      ...auth.api,
++      getSession: async (input) => {
++        const header = input.headers.get(HOME_ASSERTION_HEADER);
++        if (header !== null) {
++          // Present means home spoke: verify strictly, refuse on failure.
++          return verifyAndCache(header, input.headers, options.getKey);
++        }
++        // Same Headers object previously held a bridge assertion but the
++        // header is now gone: mutated headers invalidate and refuse.
++        if (bridgeSessionCache.get(input.headers)) return null;
++        return inner(input);
++      },
++    },
++  };
++}
+diff --git a/server/src/index.ts b/server/src/index.ts
+index b24c6e6..4f833eb 100644
+--- a/server/src/index.ts
++++ b/server/src/index.ts
+@@ -80,6 +80,7 @@ import { DEV_ACTOR, initializeDevActorUser } from "./auth/dev-actor";
+ import { createEntra, withEntraBearer } from "./auth/entra";
+ import type { AuthService } from "./auth/guards";
+ import { createRoleRepository } from "./auth/guards";
++import { wrapAuthWithHomeBridge } from "./home-bridge";
+ import { createIdentityProviderStore } from "./auth/identity-provider-store";
+ import { createOrganizationAuth } from "./auth/organization";
+ import { organizationUserStore } from "./auth/organization-store";
+@@ -568,9 +569,18 @@ const entra: ReturnType<typeof createEntra> | undefined =
+         isRevoked: (email) => peopleStore.isRevoked(email),
+       })
+     : undefined;
+-const auth: AuthService | undefined =
++const homeAuth: AuthService | undefined =
+   organizationAuth ??
+   (betterAuth && entra ? withEntraBearer(betterAuth, entra) : betterAuth);
++// Me home bridge (vendor patch 0001): server-side ht1_* -> BetterAuth
++// exchange. Wraps getSession only; BetterAuth/Entra/organization sessions,
++// guards, roles and cookie flows are untouched. Bridge-only deployments
++// (no OAuth app) get a minimal AuthService declining interactive sign-in.
++// Active only when ME_HOME_BRIDGE_SECRET is set; without it this is pure
++// delegation (or bridge-only refusal). Present-but-invalid assertions refuse.
++const auth: AuthService = wrapAuthWithHomeBridge(homeAuth, {
++  getKey: () => process.env.ME_HOME_BRIDGE_SECRET,
++});
+ const { resolveRequestActor, identifyUser, identifyActor } = createRequestActor(
+   {
+     singleUser: config.singleUser,

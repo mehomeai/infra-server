@@ -19,6 +19,17 @@ on:
         description: 'Full 40-char commit SHA for mehomeai/agentic-framework'
         required: true
         type: string
+      mode:
+        description: 'Upstream profile: core (licence-free) or full (licensed, honest NEEDS_INPUT without key)'
+        required: false
+        default: 'core'
+        type: choice
+        options: ['core', 'full', 'both']
+      openbot_ref:
+        description: 'Full 40-char OpenBot SHA (default pinned 6bfee780c8e8d05141375ea55ebde33eefb3dbc0)'
+        required: false
+        default: '6bfee780c8e8d05141375ea55ebde33eefb3dbc0'
+        type: string
 
 # Read-only: this workflow never publishes credentials, never pushes, never
 # deploys. Upstream candidate handling stays in upstream-openmuse.yml where
@@ -47,14 +58,18 @@ jobs:
           SETUP_REF: ${{ inputs.setup_ref }}
           RUNTIME_REF: ${{ inputs.runtime_ref }}
           HOME_SHA: ${{ github.sha }}
+          OPENBOT_REF: ${{ inputs.openbot_ref }}
         run: |
           re='^[0-9a-f]{40}$'
-          for v in "$BACKEND_REF" "$PHONE_REF" "$SETUP_REF" "$RUNTIME_REF"; do
+          for v in "$BACKEND_REF" "$PHONE_REF" "$SETUP_REF" "$RUNTIME_REF" "$OPENBOT_REF"; do
             if ! [[ "$v" =~ $re ]]; then
               echo "each sibling ref must be a full 40-char lowercase hex SHA"
               exit 1
             fi
           done
+          if [ "$OPENBOT_REF" != "6bfee780c8e8d05141375ea55ebde33eefb3dbc0" ]; then
+            echo "openbot_ref differs from pinned; testing candidate (read-only, no publish)"
+          fi
           echo "home uses current ref $HOME_SHA"
 
       - name: Check out home (this repo) at current ref
@@ -170,3 +185,149 @@ jobs:
       - name: Setup all suites (setup, lifecycle, full-backup, crash-window)
         run: python3 -m unittest discover -s scripts -p 'test_me*.py' -v
         working-directory: siblings/setup-infra
+
+  # Upstream Linux Docker acceptance (read-only, no secrets in logs).
+  # CORE (licence-free) must pass without Intelligence; FULL honest NEEDS_INPUT
+  # without a license key. Same fixed action SHAs; no candidate code runs here.
+  upstream-acceptance:
+    name: Upstream computer/full acceptance (Linux Docker)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    if: ${{ inputs.mode == 'core' || inputs.mode == 'full' || inputs.mode == 'both' }}
+    steps:
+      - name: Check out home (this repo) at current ref
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          path: home
+      - name: Set up the tested Node runtime
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: 24.18.0
+      - name: Verify pinned OpenBot lock (exact digests, no relax)
+        env:
+          OPENBOT_REF: ${{ inputs.openbot_ref }}
+        run: |
+          test "$OPENBOT_REF" = "6bfee780c8e8d05141375ea55ebde33eefb3dbc0" || echo "candidate OpenBot ref under test (read-only)"
+          python3 scripts/upstream-openbot.py verify
+        working-directory: home
+      - name: Full checkout pinned OpenBot (build-capable, blobless)
+        env:
+          OPENBOT_REF: ${{ inputs.openbot_ref }}
+        run: |
+          OPENBOT_REF="$OPENBOT_REF" OPENBOT_DIR="$RUNNER_TEMP/openbot" sh scripts/openbot-checkout.sh --full
+          test "$(git -C "$RUNNER_TEMP/openbot" rev-parse HEAD)" = "$OPENBOT_REF"
+        working-directory: home
+      - name: Verify fetched pinned digests (exact, fail on drift)
+        run: python3 scripts/upstream-openbot.py verify --fetch
+        working-directory: home
+      - name: Verify deployed checkout (local hashes + pin + applied home patch)
+        run: python3 scripts/upstream-openbot.py verify --deployed "$RUNNER_TEMP/openbot"
+        working-directory: home
+      - name: Validate FULL compose recipe shape (no secrets, no start)
+        env:
+          OPENBOT_CHECKOUT: ${{ runner.temp }}/openbot
+          POSTGRES_PASSWORD: dummy-config-only
+          ME_HOME_BRIDGE_SECRET: dummy-config-only-0123456789abcdef
+          WORKER_SHARED_SECRET: dummy-config-only
+          SUPERVISOR_TOKEN: dummy-config-only
+          COMPUTER_TOKEN: dummy-config-only
+          MANAGED_AGENT_TOKEN: dummy-config-only
+          HARNESS_IMAGE: dummy-config-only
+          ME_UPSTREAM_ENV_FILE: /tmp/dummy-upstream-full.env
+          DEPLOYMENT_ID: dummy-config-only
+        run: docker compose -f deploy/upstream-full.yml config -q
+        working-directory: home
+      - name: Render pinned Intelligence chart against operator overlay (no cluster, no license)
+        # Example released version from the official self-hosting guide; the
+        # operator pins per release (INTELLIGENCE_CHART_VERSION) at install.
+        env:
+          INTELLIGENCE_CHART_VERSION: '0.1.0-rc.16'
+        run: |
+          if ! command -v helm >/dev/null 2>&1; then
+            echo "helm not preinstalled on this runner; render validation runs on the operator host installer instead"
+            exit 0
+          fi
+          test -n "$INTELLIGENCE_CHART_VERSION"
+          helm template copilot-intelligence oci://ghcr.io/copilotkit/charts/intelligence \
+            --version "$INTELLIGENCE_CHART_VERSION" \
+            -f deploy/upstream-intelligence-values.yaml \
+            -f deploy/upstream-intelligence-ci-values.yaml \
+            -n copilot-intelligence > "$RUNNER_TEMP/intel-render.yaml"
+          grep -q "kind: Deployment" "$RUNNER_TEMP/intel-render.yaml"
+          grep -q "app-api" "$RUNNER_TEMP/intel-render.yaml"
+          grep -q "kind: Job" "$RUNNER_TEMP/intel-render.yaml"
+          if grep -q "thread-culler" "$RUNNER_TEMP/intel-render.yaml"; then
+            echo "render contains thread-culler (must stay disabled)"; exit 1
+          fi
+        working-directory: home
+      - name: Home + upstream unit suites (must stay green, no mock-as-integration)
+        run: |
+          npm run test:home
+          npm run test:upstream
+          python3 -m unittest discover -s scripts -p 'test_*.py' -v
+        working-directory: home
+      - name: Check out phone-app at pinned SHA (read-only, for transport acceptance)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: mehomeai/phone-app
+          ref: ${{ inputs.phone_ref }}
+          persist-credentials: false
+          path: phone-app
+      - name: Native transport acceptance (real phone client + home server + fixture, model-free)
+        env:
+          ME_ROOT: ${{ runner.temp }}/accept-roots
+          NATIVE_ACCEPT_OUT_DIR: ${{ runner.temp }}/native-accept
+        run: |
+          mkdir -p "$RUNNER_TEMP/accept-roots" "$RUNNER_TEMP/native-accept"
+          ln -sfn "$GITHUB_WORKSPACE/home" "$RUNNER_TEMP/accept-roots/infra-server"
+          ln -sfn "$GITHUB_WORKSPACE/phone-app" "$RUNNER_TEMP/accept-roots/phone-app"
+          node --experimental-transform-types --disable-warning=ExperimentalWarning home/scripts/acceptance-native.mjs
+          python3 -c "import json; d=json.load(open('$RUNNER_TEMP/native-accept/result.json')); assert d['failed']==0, d; print('native acceptance:', d['passed'], 'passed')"
+      - name: Start pinned upstream computer + supervisor (CORE, MIT-only)
+        if: ${{ inputs.mode == 'core' || inputs.mode == 'both' }}
+        env:
+          OPENBOT_CHECKOUT: ${{ runner.temp }}/openbot
+          COMPUTER_PORT: "4100"
+          SUPERVISOR_PORT: "4500"
+          SUPERVISOR_TOKEN: test-supervisor-token
+          COMPUTER_TOKEN: test-computer-token
+          COMPUTER_IMAGE: openbot-agent-computer:latest
+          COMPUTER_NAMESPACE: ci-core
+        run: |
+          docker compose -f deploy/upstream-core.yml up -d --build
+          for i in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:4500/health | grep -q '"status":"ok"'; then break; fi
+            sleep 2
+          done
+          curl -fsS http://127.0.0.1:4500/health
+        working-directory: home
+      - name: CORE doctor READY (no Intelligence required) + per-user ensure
+        if: ${{ inputs.mode == 'core' || inputs.mode == 'both' }}
+        env:
+          ME_UPSTREAM_MODE: core
+          OPENBOT_CHECKOUT: ${{ runner.temp }}/openbot
+          COMPUTER_SUPERVISOR_URL: http://127.0.0.1:4500
+          SUPERVISOR_TOKEN: test-supervisor-token
+          COMPUTER_TOKEN: test-computer-token
+          COMPUTER_NAMESPACE: ci-core
+        run: |
+          node --experimental-transform-types src/cli.mjs upstream-doctor | tee "$RUNNER_TEMP/core-doctor.json"
+          python3 -c "import json; d=json.load(open('$RUNNER_TEMP/core-doctor.json')); assert d['state']=='READY', d; assert d['checks']['license']['required']==False, d"
+        working-directory: home
+      - name: Tear down CORE stack
+        if: always() && (inputs.mode == 'core' || inputs.mode == 'both')
+        run: docker compose -f deploy/upstream-core.yml down -v || true
+        working-directory: home
+      - name: FULL doctor honest NEEDS_INPUT without license (never fake READY)
+        if: ${{ inputs.mode == 'full' || inputs.mode == 'both' }}
+        env:
+          ME_UPSTREAM_MODE: full
+          OPENBOT_CHECKOUT: ${{ runner.temp }}/openbot
+        run: |
+          node --experimental-transform-types src/cli.mjs upstream-doctor --no-probe | tee "$RUNNER_TEMP/full-doctor.json" || true
+          python3 -c "import json; d=json.load(open('$RUNNER_TEMP/full-doctor.json')); assert d['state'] in ('NEEDS_INPUT','FAILED'), d; assert d['protocol']=='upstream-platform-v1', d"
+        working-directory: home

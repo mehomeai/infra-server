@@ -1,0 +1,12 @@
+# Me home agents: exactly one personal general agent ("Me") served by the
+# chosen native AG-UI harness (B canonical recipe, POST / on 4206).
+# The endpoint is REQUIRED (no fallback): boot refuses without a harness,
+# so the roster can never silently end up empty or pointed at a sample bot.
+agents:
+  - id: me
+    name: Me
+    title: Personal Assistant
+    role_description: Help the owner with everyday personal work, clearly and concisely.
+    avatar_seed: me
+    type: remote-ag-ui
+    endpoint: ${PICKED_HARNESS_URL}

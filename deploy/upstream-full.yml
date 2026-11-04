@@ -1,0 +1,246 @@
+# Me home FULL: actual upstream OpenBot platform (licensed self-hosted Intelligence).
+#
+# PRIMARY profile per user license decision (results/license-decision.json).
+# Runs ACTUAL upstream services built from the pinned checkout
+# (OPENBOT_CHECKOUT, operator-owned path, pinned @ 6bfee78...): Postgres + migrate +
+# server + worker + supervisor + per-bot computers + managed native harness.
+# No proprietary Intelligence clone, no rewritten engine, no in-repo huge assets.
+#
+# Licensed self-hosted Intelligence is REQUIRED and runs as the OFFICIAL Helm
+# chart on the operator's Kubernetes cluster (deploy/upstream-intelligence-values.yaml);
+# this compose file wires the endpoints (INTELLIGENCE_API_URL +
+# INTELLIGENCE_GATEWAY_WS_URL + CPK_INTELLIGENCE_API_KEY) to that deployment.
+# Managed-cloud Intelligence default is refused (home privacy). No license key
+# in git; operator env/file only (0600). Local `copilotkit local` evaluation is
+# a separate PREVIEW, never production (results/official-intelligence-deployment.json).
+#
+# Launcher (single command, Linux operator host; no mandatory /opt or /run):
+#   OPENBOT_CHECKOUT=$HOME/openbot sh scripts/openbot-checkout.sh --full
+#   set -a; source $HOME/me-data/upstream-full.env; set +a   # operator-owned 0600 env
+#   ME_UPSTREAM_ENV_FILE=$HOME/me-data/upstream-full.env \
+#     OPENBOT_CHECKOUT=$HOME/openbot \
+#     docker compose -f deploy/upstream-full.yml --profile harness up -d --build
+# Or everything (checkout + patch + verify + intelligence + compose + doctor):
+#   sh scripts/upstream-full-install.sh
+#
+# Checkout discipline: OPENBOT_CHECKOUT must be the pinned revision with
+# vendor/openbot/patches applied (apply.sh, idempotent) and digests verified
+# (scripts/upstream-openbot.py verify --deployed). Sparse checkouts CANNOT
+# build images (missing build inputs); the installer uses --full (blobless
+# full tree; blobs fetched on demand for the build only).
+
+name: me-upstream-full
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg17
+    environment:
+      POSTGRES_DB: openbot
+      POSTGRES_USER: openbot
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD required (0600 env file, never git)}
+    ports:
+      - "127.0.0.1:${POSTGRES_PORT:-5432}:5432"
+      - "[::1]:${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    networks:
+      - data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U openbot -d openbot"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  migrate:
+    build:
+      context: ${OPENBOT_CHECKOUT:?OPENBOT_CHECKOUT required (pinned, patched, verified)}
+      dockerfile: server/Dockerfile
+    image: ${SERVER_IMAGE:-openbot-server}:${SERVER_TAG:-pinned}
+    pull_policy: ${IMAGE_PULL_POLICY:-build}
+    command: ["bun", "scripts/migrate.ts"]
+    environment:
+      DATABASE_URL: postgres://openbot:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD required}@postgres:5432/openbot
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+    networks:
+      - data
+
+  server:
+    build:
+      context: ${OPENBOT_CHECKOUT:?OPENBOT_CHECKOUT required (pinned, patched, verified)}
+      dockerfile: server/Dockerfile
+    image: ${SERVER_IMAGE:-openbot-server}:${SERVER_TAG:-pinned}
+    pull_policy: ${IMAGE_PULL_POLICY:-build}
+    env_file:
+      - path: ${ME_UPSTREAM_ENV_FILE:?ME_UPSTREAM_ENV_FILE required (operator-owned 0600 env file)}
+        required: true
+    environment:
+      PORT: "3001"
+      SERVER_PORT: "3001"
+      # NOTE: no NODE_ENV override — the image defaults to production
+      # (server/Dockerfile ENV NODE_ENV=production); empty would disable guards.
+      DATABASE_URL: postgres://openbot:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD required}@postgres:5432/openbot
+      AGENT_COMPUTER_URL: http://agent-computer:4100
+      COMPUTER_SUPERVISOR_URL: http://supervisor:4300
+      # The home-bridge patch reads this; the home proxy signs with it.
+      # Dedicated secret, >=32 chars, never shared with other credentials.
+      ME_HOME_BRIDGE_SECRET: ${ME_HOME_BRIDGE_SECRET:?ME_HOME_BRIDGE_SECRET required}
+      # Native harness dialing (server-container reachable names only):
+      # B's canonical image serves POST / (root) on 4206, not /api/copilotkit.
+      MANAGED_AGENT_AG_UI_URL: http://agent-harness:4206/
+      PICKED_HARNESS_URL: http://agent-harness:4206/
+      PICKED_HARNESS_CONTAINER_URL: http://agent-harness:4206/
+      MANAGED_AGENT_TOKEN: ${MANAGED_AGENT_TOKEN:?MANAGED_AGENT_TOKEN required}
+      AGENT_ENDPOINT_ALLOWED_HOSTS: agent-harness
+      # Me home tenant package record (deploy/tenant-package/me), loaded
+      # read-only (see volumes below). Never the upstream fintech sample.
+      TENANT_PACKAGE_DIR: /tenant/me
+      DEPLOYMENT_ID: ${DEPLOYMENT_ID:?DEPLOYMENT_ID required (unique home installation namespace; installer persists it)}
+    user: "${OPENBOT_SERVER_USER:-1001:1001}"
+    volumes:
+      - type: bind
+        source: ${ME_TENANT_PACKAGE_DIR:-./tenant-package}
+        target: /tenant
+        read_only: true
+    ports:
+      # Private listener: loopback only. The home server proxies to this; phones never reach it.
+      - "127.0.0.1:${SERVER_PORT:-3001}:3001"
+      - "[::1]:${SERVER_PORT:-3001}:3001"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "bun -e \"const r = await fetch('http://127.0.0.1:3001/health'); process.exit(r.ok ? 0 : 1)\""]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - data
+      - default
+
+  worker:
+    build:
+      context: ${OPENBOT_CHECKOUT:?OPENBOT_CHECKOUT required (pinned, patched, verified)}
+      dockerfile: server/Dockerfile
+    image: ${SERVER_IMAGE:-openbot-server}:${SERVER_TAG:-pinned}
+    pull_policy: ${IMAGE_PULL_POLICY:-build}
+    # From the image WORKDIR /app/server (server/Dockerfile); the upstream
+    # compose uses the same relative path (bun ../worker/src/index.ts).
+    command: ["bun", "../worker/src/index.ts"]
+    environment:
+      DATABASE_URL: postgres://openbot:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD required}@postgres:5432/openbot
+      SERVER_INTERNAL_URL: http://server:3001
+      WORKER_SHARED_SECRET: ${WORKER_SHARED_SECRET:?WORKER_SHARED_SECRET required}
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      server:
+        condition: service_started
+    restart: unless-stopped
+    networks:
+      - data
+
+  agent-computer:
+    build:
+      context: ${OPENBOT_CHECKOUT:?OPENBOT_CHECKOUT required (pinned, patched, verified)}
+      dockerfile: agent-computer/Dockerfile
+    image: ${COMPUTER_IMAGE:-openbot-agent-computer}:${COMPUTER_TAG:-pinned}
+    pull_policy: ${IMAGE_PULL_POLICY:-build}
+    ports:
+      - "127.0.0.1:${COMPUTER_PORT:-4100}:4100"
+      - "[::1]:${COMPUTER_PORT:-4100}:4100"
+    environment:
+      COMPUTER_TOKEN: ${COMPUTER_TOKEN:?COMPUTER_TOKEN required}
+      COMPUTER_BROWSER_MODE: ${COMPUTER_BROWSER_MODE:-headed}
+      COMPUTER_SEPARATE_WORKSPACES: "on"
+    volumes:
+      - agent-workspace:/workspace
+      - agent-profiles:/profiles
+    stop_grace_period: 30s
+    healthcheck:
+      test: ["CMD-SHELL", "bun -e \"await fetch('http://localhost:4100/health')\""]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  supervisor:
+    build:
+      context: ${OPENBOT_CHECKOUT:?OPENBOT_CHECKOUT required (pinned, patched, verified)}
+      dockerfile: supervisor/Dockerfile
+    image: ${SUPERVISOR_IMAGE:-openbot-supervisor}:${SUPERVISOR_TAG:-pinned}
+    pull_policy: ${IMAGE_PULL_POLICY:-build}
+    environment:
+      PORT: "4300"
+      SUPERVISOR_TOKEN: ${SUPERVISOR_TOKEN:?SUPERVISOR_TOKEN required}
+      COMPUTER_TOKEN: ${COMPUTER_TOKEN:?COMPUTER_TOKEN required}
+      COMPUTER_BROWSER_MODE: ${COMPUTER_BROWSER_MODE:-headed}
+      COMPUTER_IMAGE: ${COMPUTER_IMAGE:-openbot-agent-computer}:${COMPUTER_TAG:-pinned}
+      COMPUTER_NAMESPACE: ${COMPUTER_NAMESPACE:-openbot}
+      COMPUTER_NETWORK: ${COMPUTER_NETWORK:-}
+      COMPUTER_RUNTIME: ${COMPUTER_RUNTIME:-}
+    ports:
+      - "127.0.0.1:${SUPERVISOR_PORT:-4500}:4300"
+      - "[::1]:${SUPERVISOR_PORT:-4500}:4300"
+    volumes:
+      - ${ENGINE_SOCKET:-/var/run/docker.sock}:/var/run/docker.sock:ro
+    security_opt:
+      - label=disable
+    healthcheck:
+      test: ["CMD-SHELL", "bun -e \"await fetch('http://localhost:4300/health')\""]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Native harness (B owns the recipe; the launcher stages + builds B's
+  # canonical context — scripts/stage_agent_image_context.py from the
+  # agentic-framework sibling — then records the digest. There is NO
+  # published/official image to pull; pull_policy never refuses a missing
+  # local build loudly instead of pulling something unpinned.
+  # Serves POST / (root, AG-UI) + GET /health on 4206 per runtime-wire-contract.
+  agent-harness:
+    profiles: ["harness"]
+    image: ${HARNESS_IMAGE:-openbot-agent-langgraph-agui:6bfee780c8e8}
+    pull_policy: never
+    # Readiness handshake (OPEN #4): the harness must be able to reach
+    # Ollama on the host from INSIDE its own container namespace — parity
+    # with the server service above. The home tracker's full tier asks the
+    # harness itself for its served-model view (GET /models on 4206,
+    # ME_HARNESS_MODEL_URL when overridden) and only accepts readiness
+    # when the selected BOT_MODEL tag is served from this namespace
+    # (evidence model.namespace='harness'); a host-side /api/tags read
+    # alone never proves readiness.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    ports:
+      # Loopback only; the server reaches it as http://agent-harness:4206/.
+      - "127.0.0.1:${HARNESS_PORT:-4206}:4206"
+      - "[::1]:${HARNESS_PORT:-4206}:4206"
+    environment:
+      MANAGED_AGENT_TOKEN: ${MANAGED_AGENT_TOKEN:?MANAGED_AGENT_TOKEN required}
+      # Server-container-routable tool callback (full URL, no path append:
+      # OPENBOT_TOOL_URL already ends in /api/agent-tools/call).
+      OPENBOT_TOOL_URL: ${OPENBOT_TOOL_URL:-http://server:3001/api/agent-tools/call}
+      AGENT_TOOL_TOKEN: ${AGENT_TOOL_TOKEN:?AGENT_TOOL_TOKEN required}
+      BOT_PROVIDER: ${BOT_PROVIDER:-openai}
+      BOT_MODEL: ${BOT_MODEL:-gpt-5.5}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_BASE_URL: ${OPENAI_BASE_URL:-}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      GOOGLE_API_KEY: ${GOOGLE_API_KEY:-}
+
+networks:
+  # The database and the services that reach it by name. Nothing a Bot can
+  # reach is on it (mirrors the pinned upstream topology).
+  data:
+  # Everything else, where Bot-facing traffic stays (mirrors upstream default).
+  default:
+
+volumes:
+  postgres-data:
+  agent-workspace:
+  agent-profiles:

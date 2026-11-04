@@ -1,0 +1,33 @@
+{
+  "schema": 1,
+  "repository": "CopilotKit/OpenBot",
+  "branch": "main",
+  "revision": "6bfee780c8e8d05141375ea55ebde33eefb3dbc0",
+  "files": {
+    "LICENSE": "6d35a6bb107ae508da34636387f6208e75a6938e797bc0d5bfa9489d2ca95bad",
+    "server/Dockerfile": "cff85c99143288a1111d72d8ce2961516b316d26367ca10ac3ec1767f52410f1",
+    "supervisor/Dockerfile": "171a8af4fa56cc75386fb9c8a45af632be4859c86fd78fe7c21ee3f92893b06b",
+    "agent-computer/Dockerfile": "b9d89273528775bad1a4bc83539fa56fe6134d37cd9809a106333058afaf6343",
+    "docker-compose.yml": "1799d05f5eda3ce862b0db153ca4197e0739d60000f71c41eca5c0b9cb8650ac",
+    ".env.example": "0a12d876c950538479f903910db9364627d658548188eb9445e9f0a2df2133c7",
+    "server/src/app.ts": "d15e5ec9284674fc51fd89e07f2902a6fc0e613bc04b5a39d81a2fda79b42d20",
+    "server/src/copilot.ts": "72cb4f1565300ad468c7bf6bcdea222de51def756701f0f3e3f066f189f632ad",
+    "server/src/config.ts": "d210a4d4b3c43b869aa38483e5815ac0c3b3f77a6df2d66b5325d7510e3cf3c3",
+    "server/src/computer/routes.ts": "2d68cf858ae83053faf6c22d1d3962930cebe74c604e6eb8c557c4b5b2eb918e",
+    "server/src/computer/gateway.ts": "a4f5b6607cf719a34e1cbe71158982a65ea934c188c41cbe2716eb63dd52e0cd",
+    "server/src/computer/client.ts": "6ccaa484a9871f3dc39a0010bb60857203182e45aeb2244cbf259b4a18c72045",
+    "server/src/computer/supervisor.ts": "9ad386633acc5291746b9ad5ea7814aae38fdabf546865ef75622e7e36866215",
+    "server/src/computer/computer-key.ts": "4253ec162b28e32ba66779d4b259ec639d621faa9b9e580cec3282afbe774b5e",
+    "server/src/computer/provider.ts": "daf68e10595361681375136a3b47fe6e5e0c09680cc6462581114b9ba3dd9c55",
+    "server/src/computer/policy.ts": "ab44a44a3f8b82fc9ec920eb85796a749894b84d28cdd55902136b18c0429319",
+    "server/src/computer/schema.ts": "a27542a814f1806a6b77183a1b51a35aa0eb47b39d76d256924686f2a27b7554",
+    "supervisor/src/index.ts": "233ff37cdfe4d6b9acdefcbeff8b47a860a4ff5259e081105ee46d6e9cfb12e5",
+    "supervisor/src/docker.ts": "9cd32bd95c8fca93374e77446ca397b259f06d7ef2ff03a34208c92748a7eab2",
+    "supervisor/src/names.ts": "4fb5a00c9e9385ae003e08eb07ff8881c985a80850e7d296578da6811dcb62dc",
+    "supervisor/src/authorisation.ts": "438caaea24187c78f00c5c1e44515e114fd45b61982f09f82781eced71a33101",
+    "supervisor/src/environment.ts": "624cbd00860bcddf208fc0b34accc9340d6e09d9b3b361042980fa47223c853d",
+    "shared/intelligence-key.ts": "921d71fee2365ff1d85c9394df3f52f965ac3f0c579435d8ad40d0855dafb9b8",
+    "shared/computer-control.ts": "13e64fd046c4580f02b1893986d9d95016baac61e331bd0abbf1d6baaa976c20",
+    "docs/architecture.md": "6dbfc89fef9b32adeaa02630e7aff269f2a5a6711cde464e8dbfb3ca9b6c2634"
+  }
+}

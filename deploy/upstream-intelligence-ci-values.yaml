@@ -1,0 +1,19 @@
+# CI-only dummy overlay for `helm template` render validation (Linux CI).
+# Contains NO real credentials (dummy hostnames/passwords); never used for
+# install. Proves the operator overlay renders against the exact pinned
+# chart schema: home-required resources exist, destructive jobs absent.
+postgresql:
+  auth:
+    password: "ci-dummy-postgres-password"
+redis-subchart:
+  auth:
+    password: "ci-dummy-redis-password"
+auth:
+  issuer: "https://ci-dummy.invalid/"
+  existingSecret: "ci-dummy-auth"
+appApi:
+  licenseSecret:
+    existingSecret: "ci-dummy-license"
+ingress:
+  ui:
+    host: "ci-dummy.invalid"

@@ -9,6 +9,9 @@
     "start:home": "node --experimental-transform-types src/cli.mjs start",
     "test:spike": "node --experimental-transform-types --disable-warning=ExperimentalWarning --test spikes/openmuse/*.test.mjs",
     "demo:spike": "node --experimental-transform-types --disable-warning=ExperimentalWarning spikes/openmuse/demo.mjs",
-    "check:upstream": "python3 scripts/upstream.py verify"
+    "check:upstream": "python3 scripts/upstream.py verify && python3 scripts/upstream-openbot.py verify",
+    "check:upstream-fetch": "python3 scripts/upstream.py verify && python3 scripts/upstream-openbot.py verify --fetch",
+    "test:upstream": "node --experimental-transform-types --disable-warning=ExperimentalWarning --test test/upstream-*.test.mjs",
+    "test:upstream-bun": "bun scripts/openbot-bun-proof.ts"
   }
 }

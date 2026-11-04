@@ -1,0 +1,125 @@
+# Operator overlay for the OFFICIAL CopilotKit Intelligence Helm chart.
+# Chart: oci://ghcr.io/copilotkit/charts/intelligence (anonymous pulls allowed).
+# Docs: https://docs.copilotkit.ai/intelligence/self-hosting
+#
+# Usage (operator, cluster with kubectl + helm >=3.12, k8s >=1.28):
+#   helm pull oci://ghcr.io/copilotkit/charts/intelligence --version "$INTELLIGENCE_CHART_VERSION" --untar
+#   cp intelligence/values-onprem-example.yaml my-intel-values.yaml
+#   # layer THIS file underneath your secrets overlay (right-most -f wins):
+#   helm upgrade --install copilot-intelligence oci://ghcr.io/copilotkit/charts/intelligence \
+#     --version "$INTELLIGENCE_CHART_VERSION" \
+#     -f deploy/upstream-intelligence-values.yaml \
+#     -f my-intel-values.yaml \
+#     -n copilot-intelligence --create-namespace --wait --timeout 10m
+#
+# Version/digest pinning: INTELLIGENCE_CHART_VERSION is operator-pinned
+# (check https://github.com/CopilotKit/Intelligence/pkgs/container/charts%2Fintelligence,
+# e.g. 0.1.0-rc.16); record the resolved digest in
+# deploy/intelligence-chart.lock via scripts/upstream-intelligence-pin.sh.
+# NEVER commit license tokens or secrets here: use existingSecret /
+# externalSecrets / selfHostedSecrets with vault/ESO (see Secrets below).
+#
+# What this overlay enforces for the Me home FULL profile (single-node,
+# locally-owned default; a larger deployment overrides with managed services
+# + replicas in the operator-owned my-intel-values.yaml):
+# - app-api (4201) + app-frontend (8080) + migrations job (REQUIRED first install)
+# - realtime-gateway (4401) ENABLED: the upstream native pipeline needs it;
+#   AG-UI event persistence configured when the operator provides a bucket
+# - thread-culler stays DISABLED (destructive; operator opt-in only; the
+#   installer refuses enabled:true)
+# - single replica, no autoscaling (single-node home); bundled in-cluster
+#   Postgres + Redis (local persistence, NOT managed RDS/cloud by default)
+# - production posture: existingSecrets (no inline credentials in git),
+#   logLevel info, TLS via operator ingress config in my-intel-values.yaml
+
+# --- Me home required shape (operator fills IdP/secrets in my-intel-values.yaml) ---
+migrations:
+  enabled: true # REQUIRED for first install; without it app-api crashloops
+
+realtimeGateway:
+  enabled: true
+
+threadCuller:
+  enabled: false
+
+appApi:
+  replicaCount: 1
+  autoscaling:
+    enabled: false
+  # License token lives in a pre-created Secret (Path B) or ESO (Path A).
+  # NEVER inline the token here.
+  licenseSecret:
+    existingSecret: "cpki-license"
+    key: "license-token"
+
+config:
+  logLevel: "info"
+  nodeEnv: "production"
+
+# --- Storage: bundled in-cluster Postgres (>=14) + Redis (>=7) by default
+# (local-owned single-node persistence). Managed services are an explicit
+# operator override: set database.host/redis.host + existingSecrets and
+# postgresql.enabled/redis-subchart.enabled=false in my-intel-values.yaml.
+postgresql:
+  enabled: true
+  auth:
+    password: "" # REQUIRED operator value (chart-managed secret path)
+  primary:
+    persistence:
+      enabled: true
+      size: 8Gi
+
+redis-subchart:
+  enabled: true
+  auth:
+    password: "" # REQUIRED operator value
+  master:
+    persistence:
+      enabled: true
+      size: 2Gi
+
+database:
+  host: "" # empty: bundled subchart. Managed override sets host + existingSecret.
+  port: 5432
+  name: "intelligence"
+  existingSecret: "" # Secret key when managed: database-url
+
+redis:
+  host: "" # empty: bundled subchart. Managed override sets host + existingSecret.
+  port: 6379
+  tls: false # bundled in-cluster is plaintext; managed Redis keeps tls:true
+  existingSecret: "" # Secret key when managed: redis-url
+
+# --- Identity: operator OIDC (Keycloak/Okta/Entra/Auth0/Google Workspace) ---
+auth:
+  deploymentMode: "self-hosted"
+  issuer: "" # REQUIRED operator value (exact discovery URL; trailing slash matters)
+  existingSecret: "cpki-auth" # Secret keys: auth-secret, auth-client-id, auth-client-secret
+  defaultOrganizationId: "default"
+  providerId: "enterprise-sso"
+
+# --- Ingress/TLS: operator hosts + certs in my-intel-values.yaml ---
+ingress:
+  enabled: true
+  className: "nginx"
+  ui:
+    host: "" # REQUIRED operator value, e.g. intelligence.home.example.com
+  tls: [] # operator TLS config (cert-manager/ACM)
+
+# --- AG-UI event persistence (Intelligence threads/memory durability) ---
+# Enable when the operator provides a bucket; part of the backup contract
+# (results/datastorage-contract.json). Off by default (no silent bucket).
+objectStorage:
+  enabled: false
+  bucket: ""
+  region: "us-east-1"
+
+# --- Secrets discipline (pick exactly one path; this file sets NONE) ---
+# Path A (recommended prod): externalSecrets.enabled=true + store in overlay.
+# Path B: pre-create cpki-db/cpki-redis/cpki-auth/cpki-license Secrets by hand.
+# Path C: selfHostedSecrets.enabled=true with inline URLs ONLY in the
+#   operator-owned my-intel-values.yaml (0600), NEVER in this repo file.
+externalSecrets:
+  enabled: false
+selfHostedSecrets:
+  enabled: false

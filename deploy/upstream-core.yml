@@ -1,0 +1,76 @@
+# Me home CORE: actual upstream OpenBot computer plane (MIT-only, no license).
+#
+# Executes ACTUAL upstream Dockerfiles/services from a pinned checkout
+# (OPENBOT_CHECKOUT, default /opt/openbot @ 6bfee78...), NOT a reimplemented
+# server. Home auth/pairing + OpenMuse task worker stay in infra-server;
+# upstream owns browser/computer execution. B's runtime client calls the
+# server gateway shape in results/computer-contract.json via this stack.
+#
+# Usage:
+#   OPENBOT_CHECKOUT=/opt/openbot sh scripts/openbot-checkout.sh
+#   SUPERVISOR_TOKEN=... COMPUTER_TOKEN=... docker compose \
+#     -f ${OPENBOT_CHECKOUT:-/opt/openbot}/docker-compose.yml \
+#     -f deploy/upstream-core.yml --profile harness up -d agent-computer supervisor
+# Or start only these two services for CORE acceptance:
+#   docker compose -f deploy/upstream-core.yml up -d --build
+#
+# No Docker state in git. Volumes are host-private; see
+# results/datastorage-contract.json (C backup owner).
+
+name: me-upstream-core
+
+services:
+  agent-computer:
+    build:
+      context: ${OPENBOT_CHECKOUT:-/opt/openbot}
+      dockerfile: agent-computer/Dockerfile
+    image: ${COMPUTER_IMAGE:-openbot-agent-computer:latest}
+    pull_policy: ${IMAGE_PULL_POLICY:-build}
+    ports:
+      - "127.0.0.1:${COMPUTER_PORT:-4100}:4100"
+      - "[::1]:${COMPUTER_PORT:-4100}:4100"
+    environment:
+      COMPUTER_TOKEN: ${COMPUTER_TOKEN:?COMPUTER_TOKEN required}
+      COMPUTER_BROWSER_MODE: ${COMPUTER_BROWSER_MODE:-headed}
+      COMPUTER_SEPARATE_WORKSPACES: "on"
+    volumes:
+      - agent-workspace:/workspace
+      - agent-profiles:/profiles
+    stop_grace_period: 30s
+    healthcheck:
+      test: ["CMD-SHELL", "bun -e \"await fetch('http://localhost:4100/health')\""]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  supervisor:
+    build:
+      context: ${OPENBOT_CHECKOUT:-/opt/openbot}
+      dockerfile: supervisor/Dockerfile
+    image: ${SUPERVISOR_IMAGE:-openbot-supervisor:latest}
+    pull_policy: ${IMAGE_PULL_POLICY:-build}
+    environment:
+      PORT: "4300"
+      SUPERVISOR_TOKEN: ${SUPERVISOR_TOKEN:?SUPERVISOR_TOKEN required}
+      COMPUTER_TOKEN: ${COMPUTER_TOKEN:?COMPUTER_TOKEN required}
+      COMPUTER_BROWSER_MODE: ${COMPUTER_BROWSER_MODE:-headed}
+      COMPUTER_IMAGE: ${COMPUTER_IMAGE:-openbot-agent-computer:latest}
+      COMPUTER_NAMESPACE: ${COMPUTER_NAMESPACE:-openbot}
+      COMPUTER_NETWORK: ${COMPUTER_NETWORK:-}
+      COMPUTER_RUNTIME: ${COMPUTER_RUNTIME:-}
+    ports:
+      - "127.0.0.1:${SUPERVISOR_PORT:-4500}:4300"
+      - "[::1]:${SUPERVISOR_PORT:-4500}:4300"
+    volumes:
+      - ${ENGINE_SOCKET:-/var/run/docker.sock}:/var/run/docker.sock:ro
+    security_opt:
+      - label=disable
+    healthcheck:
+      test: ["CMD-SHELL", "bun -e \"await fetch('http://localhost:4300/health')\""]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  agent-workspace:
+  agent-profiles:

@@ -19,6 +19,7 @@ function usage() {
   node --experimental-transform-types src/cli.mjs start [--db=<path>] [--host=127.0.0.1] [--port=7070]
   node --experimental-transform-types src/cli.mjs bootstrap --user=<id> [--db=<path>] [--ttl-ms=900000] [--name=<display>]
   node --experimental-transform-types src/cli.mjs seed-dev [--db=<path>]
+  node --experimental-transform-types src/cli.mjs upstream-doctor [--no-probe]
 
 start binds loopback (${DEFAULT_HOST}) by default. bootstrap/seed-dev touch the
 SQLite file directly on this host; they never traverse the network.
@@ -111,6 +112,19 @@ if (command === 'start') {
   } finally {
     closeHomeDb(handle);
   }
+} else if (command === 'upstream-doctor') {
+  const { checkUpstreamPlatform, writeDoctorCache } = await import('./upstream-doctor.mjs');
+  const { writeFileSync } = await import('node:fs');
+  const probe = !process.argv.includes('--no-probe');
+  const cache = flag('--cache', null);
+  const report = await checkUpstreamPlatform({ probe });
+  if (cache) {
+    // Bounded live evidence for the home server capability report
+    // (data-dir owned file; server trusts it only when fresh + READY).
+    writeDoctorCache(cache, report, { fs: { writeFileSync } });
+  }
+  console.log(JSON.stringify(report, null, 2));
+  process.exit(report.state === 'FAILED' ? 1 : 0);
 } else {
   usage();
   process.exit(command ? 1 : 0);

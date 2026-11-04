@@ -1,0 +1,3 @@
+# Me home knowledge: no sample/company sources. Empty list is valid;
+# connectors granted later via the deployment, never baked-in samples.
+sources: []
